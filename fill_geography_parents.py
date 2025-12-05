@@ -50,6 +50,7 @@ class GeographyParentResult:
         self.matched_by_un_regions = 0
         self.matched_by_iai_areas_enhanced = 0
         self.matched_by_geographic_features = 0
+        self.matched_by_un_subregions_asia = 0
         self.unmatched = 0
         self.errors = []
         
@@ -83,6 +84,7 @@ class GeographyParentResult:
         print(f"   • UN Regions (Rule 21): {self.matched_by_un_regions}")
         print(f"   • IAI Areas Enhanced (Rule 22): {self.matched_by_iai_areas_enhanced}")
         print(f"   • Geographic Features (Rule 23): {self.matched_by_geographic_features}")
+        print(f"   • UN Asia subregions (Rule 24): {self.matched_by_un_subregions_asia}")
         print(f"\n❌ Unmatched: {self.unmatched}")
         print(f"📈 Coverage: {self.coverage_percentage:.2f}%")
         
@@ -105,7 +107,8 @@ class GeographyParentResult:
                 self.matched_by_continents_to_global + self.matched_by_disputed_territories +
                 self.matched_by_australia_oceania + self.matched_by_missing_african_countries +
                 self.matched_by_un_regions + self.matched_by_iai_areas_enhanced +
-                self.matched_by_geographic_features)
+                self.matched_by_geographic_features +
+                self.matched_by_un_subregions_asia)
     
     @property
     def coverage_percentage(self):
@@ -622,14 +625,25 @@ async def rule_16_regional_groups(session: AsyncSession, result: GeographyParent
     regional_mappings = {
         'Caribbean': 'Americas', 'Central America': 'Americas', 'North America': 'Americas',
         'South America': 'Americas', 'Northern America': 'Americas', 'Latin America': 'Americas',
-        'Latin America and the Caribbean': 'Americas', 'Central Asia': 'Asia', 'East Asia': 'Asia',
-        'Eastern Asia': 'Asia', 'South Asia': 'Asia', 'Southern Asia': 'Asia', 'Southeast Asia': 'Asia',
-        'South-eastern Asia': 'Asia', 'Western Asia': 'Asia', 'Middle East': 'Asia', 'Asia-Pacific': 'Asia',
+        'Latin America and the Caribbean': 'Americas',
+
+        'Central Asia': 'Asia', 'East Asia': 'Asia',
+        'Eastern Asia': 'Asia', 'South Asia': 'Asia', 'Southern Asia': 'Asia',
+        'Southeast Asia': 'Asia', 'South-eastern Asia': 'Asia',
+        'Western Asia': 'Asia', 'Middle East': 'Asia', 'Asia-Pacific': 'Asia',
+
+        'Asia without China': 'Asia',
+        'Russia (Asia)': 'Asia',
+
         'Eastern Europe': 'Europe', 'Northern Europe': 'Europe', 'Southern Europe': 'Europe',
-        'Western Europe': 'Europe', 'Central Europe': 'Europe', 'Northern Africa': 'Africa',
-        'Western Africa': 'Africa', 'Eastern Africa': 'Africa', 'Southern Africa': 'Africa',
+        'Western Europe': 'Europe', 'Central Europe': 'Europe',
+
+        'Northern Africa': 'Africa', 'Western Africa': 'Africa',
+        'Eastern Africa': 'Africa', 'Southern Africa': 'Africa',
         'Middle Africa': 'Africa', 'Sub-Saharan Africa': 'Africa',
-        'Commonwealth of Independent States': 'Europe', 'Central European Power Association': 'Europe',
+
+        'Commonwealth of Independent States': 'Europe',
+        'Central European Power Association': 'Europe',
     }
     try:
         matched_count = 0
@@ -711,13 +725,16 @@ async def rule_19_australia_oceania(session: AsyncSession, result: GeographyPare
         res = await session.execute(text("""
             INSERT INTO lca.geography_parent (geography_id, parent_geography_id, match_method, confidence, notes)
             SELECT child.id, parent.id, 'oceania_country', 'high',
-                   'Oceania country: ' || child.name || ' → Asia (Oceania subregion)'
+                   'Oceania country: ' || child.name || ' → Oceania'
             FROM lca.geography child
-            JOIN lca.geography parent ON parent.name = 'Asia'
-            WHERE child.name IN ('Australia', 'Fiji', 'Solomon Islands')
+            JOIN lca.geography parent ON LOWER(TRIM(parent.name)) = 'oceania'
+            WHERE child.name IN (
+                'Australia', 'New Zealand', 'Fiji', 'Papua New Guinea',
+                'Solomon Islands', 'Samoa', 'Tonga', 'Vanuatu'
+            )
               AND child."iso3166-1-alpha-2" IS NOT NULL
               AND NOT EXISTS (SELECT 1 FROM lca.geography_parent gp WHERE gp.geography_id = child.id)
-            LIMIT 10;
+            LIMIT 50;
         """))
         result.matched_by_australia_oceania = res.rowcount
         print(f"   ✅ Matched {res.rowcount} Oceania countries")
@@ -726,6 +743,7 @@ async def rule_19_australia_oceania(session: AsyncSession, result: GeographyPare
         await session.rollback()
         result.errors.append(f"Rule 19: {str(e)}")
         print(f"   ❌ Error: {e}")
+
 
 async def rule_20_missing_african_countries(session: AsyncSession, result: GeographyParentResult):
     print("\n🔄 Rule 20: Matching missing African countries...")
@@ -758,8 +776,9 @@ async def rule_21_un_regions(session: AsyncSession, result: GeographyParentResul
     print("\n🔄 Rule 21: Matching UN regions...")
     un_region_mappings = {
         'Europe, UN Region': 'Europe',
-        'Melanesia': 'Asia',
-        'Polynesia': 'Asia',
+        'Melanesia': 'Oceania',
+        'Polynesia': 'Oceania',
+        'Micronesia': 'Oceania',  
     }
     try:
         matched_count = 0
@@ -846,6 +865,108 @@ async def rule_23_geographic_features(session: AsyncSession, result: GeographyPa
     except Exception as e:
         await session.rollback()
         result.errors.append(f"Rule 23: {str(e)}")
+        print(f"   ❌ Error: {e}")
+
+async def rule_24_country_to_un_subregion_asia(session: AsyncSession, result: GeographyParentResult):
+    print("\n🔄 Rule 24: Matching Asian countries to UN subregions...")
+    asia_subregions = {
+        # Eastern Asia (030)
+        'Eastern Asia': [
+            'CN',  # China
+            'HK',  # Hong Kong
+            'MO',  # Macao
+            'JP',  # Japan
+            'MN',  # Mongolia
+            'KP',  # DPRK
+            'KR',  # Republic of Korea
+            'TW',  # Taiwan 
+        ],
+        # South-Eastern Asia (035)
+        'South-Eastern Asia': [
+            'BN',  # Brunei Darussalam
+            'KH',  # Cambodia
+            'ID',  # Indonesia
+            'LA',  # Lao PDR
+            'MY',  # Malaysia
+            'MM',  # Myanmar
+            'PH',  # Philippines
+            'SG',  # Singapore
+            'TH',  # Thailand
+            'TL',  # Timor-Leste
+            'VN',  # Viet Nam
+        ],
+        # Southern Asia (034)
+        'South Asia': [
+            'AF',  # Afghanistan
+            'BD',  # Bangladesh
+            'BT',  # Bhutan
+            'IN',  # India
+            'IR',  # Iran (Islamic Republic of)
+            'MV',  # Maldives
+            'NP',  # Nepal
+            'PK',  # Pakistan
+            'LK',  # Sri Lanka
+        ],
+        # Central Asia (143)
+        'Central Asia': [
+            'KZ',  # Kazakhstan
+            'KG',  # Kyrgyzstan
+            'TJ',  # Tajikistan
+            'TM',  # Turkmenistan
+            'UZ',  # Uzbekistan
+        ],
+        # Western Asia (145)
+        'Western Asia': [
+            'AM',  # Armenia
+            'AZ',  # Azerbaijan
+            'BH',  # Bahrain
+            'CY',  # Cyprus
+            'GE',  # Georgia
+            'IQ',  # Iraq
+            'IL',  # Israel
+            'JO',  # Jordan
+            'KW',  # Kuwait
+            'LB',  # Lebanon
+            'OM',  # Oman
+            'QA',  # Qatar
+            'SA',  # Saudi Arabia
+            'PS',  # State of Palestine
+            'SY',  # Syrian Arab Republic
+            'TR',  # Turkey
+            'AE',  # United Arab Emirates
+            'YE',  # Yemen
+        ],
+    }
+
+    try:
+        matched_count = 0
+        for region_name, iso_list in asia_subregions.items():
+            for iso2 in iso_list:
+                res = await session.execute(text("""
+                    INSERT INTO lca.geography_parent
+                        (geography_id, parent_geography_id, match_method, confidence, notes)
+                    SELECT child.id, parent.id,
+                           'un_subregion_asia', 'high',
+                           'UN Asia subregion: ' || :region_name
+                    FROM lca.geography child
+                    JOIN lca.geography parent
+                      ON LOWER(TRIM(parent.name)) = LOWER(:region_name)
+                    WHERE child."iso3166-1-alpha-2" = :iso2
+                      AND child."unsd-m49" IS NOT NULL
+                      AND NOT EXISTS (
+                          SELECT 1 FROM lca.geography_parent gp
+                          WHERE gp.geography_id = child.id
+                      )
+                    LIMIT 1;
+                """), {"region_name": region_name, "iso2": iso2})
+                matched_count += res.rowcount
+
+        result.matched_by_un_subregions_asia = matched_count
+        print(f"   ✅ Matched {matched_count} Asian countries to UN subregions")
+        await session.commit()
+    except Exception as e:
+        await session.rollback()
+        result.errors.append(f"Rule 24: {str(e)}")
         print(f"   ❌ Error: {e}")
 
 
@@ -950,7 +1071,7 @@ async def main():
             result.total_geographies = analysis["total"]
             
             await create_geography_parent_table(session)
-            
+            await rule_24_country_to_un_subregion_asia(session, result)
             await rule_15_country_to_continent_m49(session, result)
             await rule_25_country_code_in_name(session, result)
             await rule_16_regional_groups(session, result)
