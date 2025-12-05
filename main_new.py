@@ -66,8 +66,6 @@ class RecommendRequest(BaseModel):
     query_text: Optional[str] = ""
     geography_id: Optional[str] = None
     ref_unit_id: Optional[str] = None
-
-    query_lcia_description_id: Optional[str] = None
     query_lcia_name: Optional[str] = None
     query_upr_exchange_name: Optional[str] = None
     query_stage_name: Optional[str] = None
@@ -311,11 +309,17 @@ async def _fetch_cpc_name_for_query(
     except Exception as e:
         return None
 
-
 async def build_query_embedding_v2(
     session: AsyncSession,
     req: RecommendRequest,
 ) -> tuple[Optional[List[float]], Optional[List[float]], str]:
+    """
+    返回：
+    - metadata_vec: 基于结构化元数据的向量
+    - query_vec: 基于用户自由文本的向量
+    - semantic_text: 用于调试的文本
+    """
+    
     db_cpc_name = await _fetch_cpc_name_for_query(
         session,
         req.query_lcia_description_id,
@@ -695,19 +699,6 @@ def calc_score_lcia_fast(
                 if keyword in lcia_name:
                     exact_match_bonus += 0.3
                     score_details["keyword_match"]["match_type"] = "exact"
-                else:
-                    conflicting_keywords = {
-                        "alpine": ["tropical", "temperate"],
-                        "tropical": ["alpine", "temperate"],
-                        "temperate": ["alpine", "tropical"],
-                    }
-                    
-                    if keyword in conflicting_keywords:
-                        for conflict in conflicting_keywords[keyword]:
-                            if conflict in lcia_name:
-                                fuzzy_match_penalty -= 0.5
-                                score_details["keyword_match"]["match_type"] = "conflict"
-                                print(f"     ⚠️  Keyword conflict detected: query='{keyword}' vs result='{conflict}'")
             
             keyword_adjustment = exact_match_bonus + fuzzy_match_penalty
             if keyword_adjustment != 0:
