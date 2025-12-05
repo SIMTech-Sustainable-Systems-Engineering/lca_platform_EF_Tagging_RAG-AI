@@ -1,4 +1,3 @@
-# file: build_lcia_semantic_index.py
 import os
 import torch
 import numpy as np
@@ -9,9 +8,6 @@ from sqlalchemy import text
 import asyncio
 import urllib.parse
 
-# ============================
-# 0. 数据库连接配置
-# ============================
 DB_USER = os.getenv("DB_USER")
 DB_PWD = os.getenv("DB_PWD")
 DB_HOST = os.getenv("DB_HOST", "localhost")
@@ -26,32 +22,20 @@ DATABASE_URL = f"postgresql+asyncpg://{DB_USER}:{encoded_pwd}@{DB_HOST}/{DB_NAME
 engine = create_async_engine(DATABASE_URL)
 SessionLocal = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
 
-# ============================
-# 1. 加载 E5-small-v2 模型
-# ============================
 MODEL_NAME = "intfloat/e5-small-v2"
 print("🚀 Loading E5-small-v2 embedding model ...")
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model = SentenceTransformer(MODEL_NAME, device=device)
 print(f"✅ Model loaded on {device}")
 
-# ============================
-# 2. 辅助函数
-# ============================
 
 def safe_join(items, sep="; "):
-    """把 list 安全拼接成字符串"""
     if not items:
         return ""
     return sep.join([str(x) for x in items if x])
 
 
 def normalize_meta_field(value):
-    """
-    清洗 metadata 字段：
-    - None / 空串 / 空格 → None
-    - 'undefined' / 'not defined' / 'n/a' 等 → None
-    """
     if value is None:
         return None
     s = str(value).strip()
@@ -63,15 +47,6 @@ def normalize_meta_field(value):
 
 
 def build_embedding_text(row) -> str:
-    """
-    按新模板构造 embedding_text：
-    passage: LCIA name: ...
-           | Reference product: ...
-           | CPC name: ...
-           | Stage: ...
-           | Process: ...
-           | General comment: ...
-    """
     lcia_name = normalize_meta_field(row.get("lcia_name"))
     upr_name = normalize_meta_field(row.get("upr_exchange_name"))
     general_comment = normalize_meta_field(row.get("general_comment"))
@@ -80,7 +55,6 @@ def build_embedding_text(row) -> str:
     stage_names_raw = row.get("stage_names") or []
     process_names_raw = row.get("process_names") or []
 
-    # 过滤掉 'undefined' 等垃圾值
     stage_names = [s for s in (stage_names_raw or []) if normalize_meta_field(s)]
     process_names = [s for s in (process_names_raw or []) if normalize_meta_field(s)]
 
@@ -108,7 +82,6 @@ def build_embedding_text(row) -> str:
 
 
 def embed_texts(texts):
-    """生成 L2 归一化 embedding（float32）"""
     embeddings = model.encode(
         texts,
         convert_to_numpy=True,
@@ -119,16 +92,7 @@ def embed_texts(texts):
     return embeddings.astype(np.float32)
 
 
-# ============================
-# 3. 主逻辑：构建 rag_lcia_semantic_index
-# ============================
-
 async def build_lcia_semantic_index(fetch_size: int = 5000, batch_size: int = 500):
-    """
-    从 lcia_description 聚合相关信息，生成 embedding_text + embedding，
-    写入 lca.rag_lcia_semantic_index。
-    """
-
     async with SessionLocal() as session:
         count_sql = text("SELECT COUNT(*) FROM lca.lcia_description")
         count_result = await session.execute(count_sql)
@@ -180,7 +144,7 @@ async def build_lcia_semantic_index(fetch_size: int = 5000, batch_size: int = 50
             rows = result.mappings().all()
 
             if not rows:
-                break  # 没有更多行了
+                break
 
             texts_to_embed = []
             rows_data = []
@@ -227,10 +191,6 @@ async def build_lcia_semantic_index(fetch_size: int = 5000, batch_size: int = 50
         pbar.close()
         print(f"✅ Completed: {processed} LCIA descriptions processed.")
 
-
-# ============================
-# 4. 脚本入口
-# ============================
 
 async def main():
     await build_lcia_semantic_index(fetch_size=5000, batch_size=500)

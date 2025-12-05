@@ -1,26 +1,3 @@
-# fill_geography_parents_FINAL_OPTIMIZED.py
-"""
-地理父级关系自动填充脚本 - 最终完全优化版 v2.0
-当前覆盖率：93.68% (504/538)
-目标：98%+ (剩余 34 个未匹配)
-
-✅ 关键优化：
-1. 修复 SQL 语法错误 (ON CONFLICT ... LIMIT)
-2. 简化和合并冗余规则
-3. 针对剩余 34 个特殊情况添加精确规则
-4. 移除无效规则（Rule 3, Rule 5, Rule 11）
-5. 优化执行顺序，高效规则优先
-
-剩余未匹配数据分析：
-- 5 个大洲本身 (Africa, Americas, Asia, Europe, Oceania)
-- 10 个非洲/亚洲/大洋洲国家 (Djibouti, Eritrea, Fiji, Gabon, Gambia, Ghana, Guinea, Ethiopia, Equatorial Guinea, Solomon Islands)
-- 3 个争议领土 (Kosovo, Palestine, Somaliland)
-- 4 个地理特征 (Siachen Glacier, Scarborough Reef, Serranilla Bank, Spratly Islands)
-- 2 个军事基地 (Dhekelia Sovereign Base Area, Antarctica)
-- 5 个电网/组织 (ENTSO-E, UCTE, WECC, Québec HQ, North America without Quebec)
-- 3 个 IAI 区域
-- 2 个 UN 区域 (Melanesia, Polynesia)
-"""
 
 import os
 import asyncio
@@ -35,9 +12,6 @@ from sqlalchemy import text
 
 load_dotenv()
 
-# ============================
-# 数据库连接配置
-# ============================
 DB_USER = os.getenv("DB_USER")
 DB_PWD = os.getenv("DB_PWD")
 DB_HOST = os.getenv("DB_HOST", "localhost")
@@ -52,11 +26,7 @@ engine = create_async_engine(DATABASE_URL, pool_pre_ping=True, echo=False)
 SessionLocal = async_sessionmaker(bind=engine, expire_on_commit=False, class_=AsyncSession)
 
 
-# ============================
-# 数据类
-# ============================
 class GeographyParentResult:
-    """存储填充结果的统计信息"""
     def __init__(self):
         self.total_geographies = 0
         self.matched_by_iso3166_2 = 0
@@ -73,7 +43,6 @@ class GeographyParentResult:
         self.matched_by_fuzzy_name = 0
         self.matched_by_country_to_continent = 0
         self.matched_by_regional_groups = 0
-        # ✅ 新增
         self.matched_by_continents_to_global = 0
         self.matched_by_disputed_territories = 0
         self.matched_by_australia_oceania = 0
@@ -85,7 +54,6 @@ class GeographyParentResult:
         self.errors = []
         
     def print_report(self):
-        """打印详细报告"""
         print("\n" + "="*80)
         print("📊 GEOGRAPHY PARENT FILLING REPORT - v2.0")
         print("="*80)
@@ -146,11 +114,7 @@ class GeographyParentResult:
         return (self.total_matched / self.total_geographies) * 100
 
 
-# ============================
-# 创建表和分析
-# ============================
 async def create_geography_parent_table(session: AsyncSession):
-    """创建 geography_parent 表"""
     print("🔧 Creating geography_parent table...")
     try:
         await session.execute(text("DROP TABLE IF EXISTS lca.geography_parent CASCADE;"))
@@ -183,7 +147,6 @@ async def create_geography_parent_table(session: AsyncSession):
         raise
 
 async def analyze_current_data(session: AsyncSession) -> Dict:
-    """分析数据"""
     print("="*80)
     print("🔍 ANALYZING CURRENT GEOGRAPHY DATA")
     print("="*80)
@@ -202,12 +165,7 @@ async def analyze_current_data(session: AsyncSession) -> Dict:
     return {"total": overall.total}
 
 
-# ============================
-# CORE RULES (保留有效规则，移除冗余)
-# ============================
-
 async def rule_1_iso3166_2_matching(session: AsyncSession, result: GeographyParentResult):
-    """规则 1: ISO 3166-2 → ISO 3166-1 (高效规则，保留)"""
     print("🔄 Rule 1: Processing ISO 3166-2 subdivisions...")
     try:
         res = await session.execute(text("""
@@ -230,7 +188,6 @@ async def rule_1_iso3166_2_matching(session: AsyncSession, result: GeographyPare
         print(f"   ❌ Error: {e}")
 
 async def rule_2_unsd_m49_matching(session: AsyncSession, result: GeographyParentResult):
-    """规则 2: UNSD M.49 (保留)"""
     print("\n🔄 Rule 2: Processing UNSD M.49 country→region...")
     m49_country_to_region = {'012': '002', '818': '002', '434': '002'}
     try:
@@ -254,7 +211,6 @@ async def rule_2_unsd_m49_matching(session: AsyncSession, result: GeographyParen
         print(f"   ❌ Error: {e}")
 
 async def rule_25_country_code_in_name(session: AsyncSession, result: GeographyParentResult):
-    """规则 2.5: 名称前缀匹配 (最高效规则，保留)"""
     print("\n🔄 Rule 2.5: Matching by country name in title...")
     try:
         res = await session.execute(text("""
@@ -290,7 +246,6 @@ async def rule_25_country_code_in_name(session: AsyncSession, result: GeographyP
         print(f"   ❌ Error: {e}")
 
 async def rule_4_special_cases(session: AsyncSession, result: GeographyParentResult):
-    """规则 4: 特殊情况 (保留并增强)"""
     print("\n🔄 Rule 4: Handling special cases...")
     try:
         matched_count = 0
@@ -325,7 +280,6 @@ async def rule_4_special_cases(session: AsyncSession, result: GeographyParentRes
         print(f"   ❌ Error: {e}")
 
 async def rule_6_without_regions(session: AsyncSession, result: GeographyParentResult):
-    """规则 6: 排除型区域 (保留)"""
     print("\n🔄 Rule 6: Matching 'without' regions...")
     try:
         res = await session.execute(text("""
@@ -347,7 +301,6 @@ async def rule_6_without_regions(session: AsyncSession, result: GeographyParentR
         print(f"   ❌ Error: {e}")
 
 async def rule_7_grid_regions(session: AsyncSession, result: GeographyParentResult):
-    """规则 7: 电网区域 (保留)"""
     print("\n🔄 Rule 7: Matching grid regions...")
     grid_mappings = {'BR-': 'Brazil', 'CN-': 'China', 'IN-': 'India', 'US-': 'United States',
                     'CA-': 'Canada', 'AU-': 'Australia', 'RU-': 'Russia', 'EU-': 'Europe'}
@@ -374,7 +327,6 @@ async def rule_7_grid_regions(session: AsyncSession, result: GeographyParentResu
         print(f"   ❌ Error: {e}")
 
 async def rule_8_iai_regions(session: AsyncSession, result: GeographyParentResult):
-    """规则 8: IAI 区域 (保留)"""
     print("\n🔄 Rule 8: Matching IAI regions...")
     try:
         res = await session.execute(text("""
@@ -396,7 +348,6 @@ async def rule_8_iai_regions(session: AsyncSession, result: GeographyParentResul
         print(f"   ❌ Error: {e}")
 
 async def rule_9_special_islands(session: AsyncSession, result: GeographyParentResult):
-    """规则 9: 特殊岛屿 (保留)"""
     print("\n🔄 Rule 9: Matching special islands...")
     island_mappings = {
         'Canary Islands': 'Spain', 'British Virgin Islands': 'Europe',
@@ -430,7 +381,6 @@ async def rule_9_special_islands(session: AsyncSession, result: GeographyParentR
         print(f"   ❌ Error: {e}")
 
 async def rule_10_sovereignty_matching(session: AsyncSession, result: GeographyParentResult):
-    """规则 10: Sovereignty 字段 (高效规则，保留)"""
     print("\n🔄 Rule 10: Matching by sovereignty field...")
     try:
         res = await session.execute(text("""
@@ -454,7 +404,6 @@ async def rule_10_sovereignty_matching(session: AsyncSession, result: GeographyP
         print(f"   ❌ Error: {e}")
 
 async def rule_12_complex_exclusion_regions(session: AsyncSession, result: GeographyParentResult):
-    """规则 12: 复杂排除型区域 (保留)"""
     print("\n🔄 Rule 12: Matching complex exclusion regions...")
     complex_mappings = {
         'RER': 'Europe', 'RoW': 'GLO', 'WECC': 'United States',
@@ -484,7 +433,6 @@ async def rule_12_complex_exclusion_regions(session: AsyncSession, result: Geogr
         print(f"   ❌ Error: {e}")
 
 async def rule_13_economic_regions(session: AsyncSession, result: GeographyParentResult):
-    """规则 13: 经济区域 (保留)"""
     print("\n🔄 Rule 13: Matching economic regions...")
     economic_mappings = {
         'APEC': 'Asia', 'ASEAN': 'Asia', 'EU-27': 'Europe', 'EU-28': 'Europe',
@@ -514,7 +462,6 @@ async def rule_13_economic_regions(session: AsyncSession, result: GeographyParen
         print(f"   ❌ Error: {e}")
 
 async def rule_14_fuzzy_name_enhancement(session: AsyncSession, result: GeographyParentResult):
-    """规则 14: 模糊名称匹配 (保留)"""
     print("\n🔄 Rule 14: Enhanced fuzzy name matching...")
     try:
         res = await session.execute(text("""
@@ -554,12 +501,10 @@ async def rule_14_fuzzy_name_enhancement(session: AsyncSession, result: Geograph
         print(f"   ❌ Error: {e}")
 
 async def rule_15_country_to_continent_m49(session: AsyncSession, result: GeographyParentResult):
-    """规则 15: 国家 → 大洲 (最关键规则，已修复)"""
     print("\n🔄 Rule 15: Matching countries to continents (UNSD M.49) [FIXED]...")
     try:
         matched_count = 0
         
-        # 非洲国家
         res = await session.execute(text("""
             INSERT INTO lca.geography_parent (geography_id, parent_geography_id, match_method, confidence, notes)
             SELECT child.id, parent.id, 'country_to_continent_m49', 'high', 'M.49 Africa codes → Africa'
@@ -576,7 +521,6 @@ async def rule_15_country_to_continent_m49(session: AsyncSession, result: Geogra
         matched_count += res.rowcount
         print(f"      • Africa: {res.rowcount}")
         
-        # 美洲国家
         res = await session.execute(text("""
             INSERT INTO lca.geography_parent (geography_id, parent_geography_id, match_method, confidence, notes)
             SELECT child.id, parent.id, 'country_to_continent_m49', 'high', 'M.49 Americas codes → Americas'
@@ -591,7 +535,6 @@ async def rule_15_country_to_continent_m49(session: AsyncSession, result: Geogra
         matched_count += res.rowcount
         print(f"      • Americas: {res.rowcount}")
         
-        # 亚洲国家
         res = await session.execute(text("""
             INSERT INTO lca.geography_parent (geography_id, parent_geography_id, match_method, confidence, notes)
             SELECT child.id, parent.id, 'country_to_continent_m49', 'high', 'M.49 Asia codes → Asia'
@@ -606,7 +549,6 @@ async def rule_15_country_to_continent_m49(session: AsyncSession, result: Geogra
         matched_count += res.rowcount
         print(f"      • Asia: {res.rowcount}")
         
-        # 欧洲国家
         res = await session.execute(text("""
             INSERT INTO lca.geography_parent (geography_id, parent_geography_id, match_method, confidence, notes)
             SELECT child.id, parent.id, 'country_to_continent_m49', 'high', 'M.49 Europe codes → Europe'
@@ -621,7 +563,6 @@ async def rule_15_country_to_continent_m49(session: AsyncSession, result: Geogra
         matched_count += res.rowcount
         print(f"      • Europe: {res.rowcount}")
         
-        # 兜底规则
         res = await session.execute(text("""
             INSERT INTO lca.geography_parent (geography_id, parent_geography_id, match_method, confidence, notes)
             SELECT child.id, parent.id, 'country_to_continent_m49_digit', 'medium', 'M.49 1xx → Europe (fallback)'
@@ -677,7 +618,6 @@ async def rule_15_country_to_continent_m49(session: AsyncSession, result: Geogra
         traceback.print_exc()
 
 async def rule_16_regional_groups(session: AsyncSession, result: GeographyParentResult):
-    """规则 16: 区域性组织 (高效规则，保留)"""
     print("\n🔄 Rule 16: Matching regional groups to continents...")
     regional_mappings = {
         'Caribbean': 'Americas', 'Central America': 'Americas', 'North America': 'Americas',
@@ -713,10 +653,6 @@ async def rule_16_regional_groups(session: AsyncSession, result: GeographyParent
         print(f"   ❌ Error: {e}")
 
 async def rule_17_continents_to_global(session: AsyncSession, result: GeographyParentResult):
-    """
-    ✅ 规则 17: 大洲 → Global
-    处理：Africa, Americas, Asia, Europe, Oceania
-    """
     print("\n🔄 Rule 17: Matching continents to Global...")
     try:
         res = await session.execute(text("""
@@ -741,10 +677,6 @@ async def rule_17_continents_to_global(session: AsyncSession, result: GeographyP
         print(f"   ❌ Error: {e}")
 
 async def rule_18_disputed_territories(session: AsyncSession, result: GeographyParentResult):
-    """
-    ✅ 规则 18: 争议领土
-    处理：Kosovo, Palestine, Somaliland
-    """
     print("\n🔄 Rule 18: Matching disputed territories...")
     disputed_mappings = {
         'Kosovo': 'Europe',
@@ -774,9 +706,6 @@ async def rule_18_disputed_territories(session: AsyncSession, result: GeographyP
         print(f"   ❌ Error: {e}")
 
 async def rule_19_australia_oceania(session: AsyncSession, result: GeographyParentResult):
-    """
-    ✅ 规则 19: Australia, Fiji, Solomon Islands → Oceania
-    """
     print("\n🔄 Rule 19: Matching Australia/Oceania countries...")
     try:
         res = await session.execute(text("""
@@ -799,10 +728,6 @@ async def rule_19_australia_oceania(session: AsyncSession, result: GeographyPare
         print(f"   ❌ Error: {e}")
 
 async def rule_20_missing_african_countries(session: AsyncSession, result: GeographyParentResult):
-    """
-    ✅ 规则 20: 剩余非洲国家 → Africa
-    处理：Djibouti, Equatorial Guinea, Eritrea, Ethiopia, Gabon, Gambia, Ghana, Guinea
-    """
     print("\n🔄 Rule 20: Matching missing African countries...")
     african_countries = ['Djibouti', 'Equatorial Guinea', 'Eritrea', 'Ethiopia', 
                         'Gabon', 'Gambia', 'Ghana', 'Guinea']
@@ -830,15 +755,11 @@ async def rule_20_missing_african_countries(session: AsyncSession, result: Geogr
         print(f"   ❌ Error: {e}")
 
 async def rule_21_un_regions(session: AsyncSession, result: GeographyParentResult):
-    """
-    ✅ 规则 21: UN 区域 → 对应大洲
-    处理：Europe UN Region, Melanesia, Polynesia
-    """
     print("\n🔄 Rule 21: Matching UN regions...")
     un_region_mappings = {
         'Europe, UN Region': 'Europe',
-        'Melanesia': 'Asia',  # Oceania 子区域
-        'Polynesia': 'Asia',  # Oceania 子区域
+        'Melanesia': 'Asia',
+        'Polynesia': 'Asia',
     }
     try:
         matched_count = 0
@@ -863,10 +784,6 @@ async def rule_21_un_regions(session: AsyncSession, result: GeographyParentResul
         print(f"   ❌ Error: {e}")
 
 async def rule_22_iai_areas_enhanced(session: AsyncSession, result: GeographyParentResult):
-    """
-    ✅ 规则 22: IAI 区域增强匹配
-    处理：Gulf Cooperation Council → Asia, North America → Americas
-    """
     print("\n🔄 Rule 22: Matching IAI areas (enhanced)...")
     iai_mappings = {
         'IAI Area, Gulf Cooperation Council': 'Asia',
@@ -895,28 +812,19 @@ async def rule_22_iai_areas_enhanced(session: AsyncSession, result: GeographyPar
         print(f"   ❌ Error: {e}")
 
 async def rule_23_geographic_features(session: AsyncSession, result: GeographyParentResult):
-    """
-    ✅ 规则 23: 地理特征和特殊区域
-    处理：军事基地、争议岛屿、电网组织等
-    """
     print("\n🔄 Rule 23: Matching geographic features and special zones...")
     special_mappings = {
-        # 军事基地和特殊区域
-        'Dhekelia Sovereign Base Area': 'Asia',  # Cyprus 附近
+        'Dhekelia Sovereign Base Area': 'Asia',
         'Siachen Glacier': 'Asia',
         'Scarborough Reef': 'Asia',
-        'Serranilla Bank': 'Americas',  # Caribbean
+        'Serranilla Bank': 'Americas',
         'Spratly Islands': 'Asia',
-        
-        # 电网组织
         'European Network of Transmission Systems Operators for Electricity': 'Europe',
         'Union for the Co-ordination of Transmission of Electricity': 'Europe',
         'Western Electricity Coordinating Council': 'Americas',
-        
-        # 特殊区域
         'North America without Quebec': 'Americas',
         'Québec, Hydro-Québec distribution network': 'Americas',
-        'Oceania': 'Global',  # Oceania 大洲 → Global
+        'Oceania': 'Global',
     }
     try:
         matched_count = 0
@@ -941,11 +849,7 @@ async def rule_23_geographic_features(session: AsyncSession, result: GeographyPa
         print(f"   ❌ Error: {e}")
 
 
-# ============================
-# 导出和验证
-# ============================
 async def export_unmatched_geographies(session: AsyncSession) -> int:
-    """导出未匹配的地理实体"""
     print("\n📄 Exporting unmatched geographies with all columns...")
     try:
         rows = await session.execute(text("""
@@ -978,7 +882,6 @@ async def export_unmatched_geographies(session: AsyncSession) -> int:
         return 0
 
 async def validate_results(session: AsyncSession):
-    """验证结果"""
     print("\n" + "="*80)
     print("🔍 VALIDATING RESULTS")
     print("="*80)
@@ -1014,7 +917,6 @@ async def validate_results(session: AsyncSession):
     print("="*80 + "\n")
 
 async def rule_0_insert_unmatched(session: AsyncSession, result: GeographyParentResult):
-    """兜底规则: 插入所有未匹配的 geography_id"""
     print("\n🔄 Rule 0: Inserting unmatched geographies...")
     try:
         res = await session.execute(text("""
@@ -1034,11 +936,7 @@ async def rule_0_insert_unmatched(session: AsyncSession, result: GeographyParent
         print(f"   ❌ Error: {e}")
 
 
-# ============================
-# 主函数
-# ============================
 async def main():
-    """主执行流程"""
     print("\n" + "🌍"*40)
     print("GEOGRAPHY PARENT RELATIONSHIP FILLING SCRIPT - v2.0 FINAL OPTIMIZED")
     print("Target: 98%+ coverage (Current: 93.68% → Expected: 98%+)")
@@ -1053,13 +951,11 @@ async def main():
             
             await create_geography_parent_table(session)
             
-            # Core high-efficiency rules (优先执行高效规则)
-            await rule_15_country_to_continent_m49(session, result)  # 最关键！
-            await rule_25_country_code_in_name(session, result)      # 最高效！
+            await rule_15_country_to_continent_m49(session, result)
+            await rule_25_country_code_in_name(session, result)
             await rule_16_regional_groups(session, result)
             await rule_10_sovereignty_matching(session, result)
             
-            # Standard rules
             await rule_1_iso3166_2_matching(session, result)
             await rule_2_unsd_m49_matching(session, result)
             await rule_4_special_cases(session, result)
@@ -1071,7 +967,6 @@ async def main():
             await rule_13_economic_regions(session, result)
             await rule_14_fuzzy_name_enhancement(session, result)
             
-            # ✅ NEW Final Sweep Rules (处理剩余 34 个)
             await rule_17_continents_to_global(session, result)
             await rule_18_disputed_territories(session, result)
             await rule_19_australia_oceania(session, result)
