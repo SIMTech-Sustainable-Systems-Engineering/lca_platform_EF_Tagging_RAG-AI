@@ -313,26 +313,12 @@ async def build_query_embedding_v2(
     session: AsyncSession,
     req: RecommendRequest,
 ) -> tuple[Optional[List[float]], Optional[List[float]], str]:
-    """
-    返回：
-    - metadata_vec: 基于结构化元数据的向量
-    - query_vec: 基于用户自由文本的向量
-    - semantic_text: 用于调试的文本
-    """
-    
-    db_cpc_name = await _fetch_cpc_name_for_query(
-        session,
-        req.query_lcia_description_id,
-    )
-    cpc_name = normalize_text_field(req.query_cpc_name) or db_cpc_name
 
     metadata_parts = []
     if normalize_text_field(req.query_lcia_name):
         metadata_parts.append(f"LCIA name: {normalize_text_field(req.query_lcia_name)}")
     if normalize_text_field(req.query_upr_exchange_name):
         metadata_parts.append(f"Reference product: {normalize_text_field(req.query_upr_exchange_name)}")
-    if cpc_name:
-        metadata_parts.append(f"CPC name: {cpc_name}")
     if normalize_text_field(req.query_stage_name):
         metadata_parts.append(f"Stage: {normalize_text_field(req.query_stage_name)}")
     if normalize_text_field(req.query_process_name):
