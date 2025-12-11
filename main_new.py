@@ -4,6 +4,7 @@ import asyncio
 import traceback
 from typing import List, Literal, Optional, Dict, Any
 from urllib.parse import quote_plus
+import re
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -281,33 +282,72 @@ async def get_geography_distance(session: AsyncSession, geo_a: str, geo_b: str) 
         return 0.0
 
 
-async def _fetch_cpc_name_for_query(
-    session: AsyncSession,
-    lcia_description_id: Optional[str],
-) -> Optional[str]:
-    if not lcia_description_id:
-        return None
+def should_use_keyword_channel(query: Optional[str]) -> bool:
+    """
+    Enable tsvector channel only when query contains digits/years/model numbers/uppercase abbreviations
+    to avoid affecting general natural language retrieval.
+    """
+    if not query:
+        return False
+    q = query.strip()
+    if not q:
+        return False
 
-    try:
-        sql = text("""
-            SELECT cpc.name AS cpc_name
-            FROM lca.lcia_description ld
-            JOIN lca.lcia l
-              ON l.id = ld.lcia_id
-            JOIN lca.upr_exchange_name uen
-              ON uen.id = ld.upr_exchange_name_id
-             AND uen.lcia_database_id = l.lcia_database_id
-            LEFT JOIN lca.classification_cpc2_1_all cpc
-              ON cpc.id = uen.classification_cpc2_1_all_id
-            WHERE ld.id = CAST(:desc_id AS uuid)
-        """)
-        res = await session.execute(sql, {"desc_id": lcia_description_id})
-        row = res.first()
-        if not row:
-            return None
-        return normalize_text_field(row.cpc_name)
-    except Exception as e:
-        return None
+    if any(ch.isdigit() for ch in q):
+        return True
+
+    if re.search(r"\b[A-Z]{2,}[0-9]*\b", q):
+        return True
+
+    if re.search(r"\b[A-Za-z]+-[A-Za-z0-9]+\b", q):
+        return True
+
+    return False
+
+
+async def keyword_scores_for_candidates(
+    session: AsyncSession,
+    query_text: str,
+    candidate_ids: List[str],
+) -> Dict[str, float]:
+    if not candidate_ids:
+        return {}
+
+    q = (query_text or "").strip()
+    if not q:
+        return {}
+
+    sql = text("""
+        SELECT
+            s.lcia_description_id,
+            ts_rank(
+                to_tsvector('simple', s.embedding_text),
+                plainto_tsquery('simple', :q),
+                1
+            ) * 100 AS kw_score
+        FROM lca.rag_lcia_semantic_index s
+        WHERE s.lcia_description_id = ANY(:candidate_ids)
+          AND to_tsvector('simple', s.embedding_text) @@ plainto_tsquery('simple', :q)
+    """)
+
+    res = await session.execute(sql, {
+        "q": q,
+        "candidate_ids": candidate_ids,
+    })
+    rows = res.all()
+
+    scores: Dict[str, float] = {}
+    for row in rows:
+        if row.kw_score is not None and float(row.kw_score) > 0:
+            scores[str(row.lcia_description_id)] = float(row.kw_score)
+    
+    print("🔎 keyword_scores_for_candidates -> q =", q)
+    print("   candidate_ids =", candidate_ids[:5], "...")
+    print(f"   kw rows: {len(rows)}, matched: {len(scores)}")
+    if scores:
+        print(f"   score range: {min(scores.values()):.4f} ~ {max(scores.values()):.4f}")
+    
+    return scores
 
 async def build_query_embedding_v2(
     session: AsyncSession,
@@ -440,8 +480,10 @@ async def _vector_search_within_candidates(
     return [dict(r) for r in res.mappings().all()]
 
 
-async def _vector_search(session: AsyncSession, qvec: List[float], limit: int) -> List[dict]:
+async def _vector_search(session: AsyncSession, qvec: List[float], limit: int, max_distance: float = 0.5) -> List[dict]:
     vec_literal = "[" + ",".join(str(x) for x in qvec) + "]"
+    
+    await session.execute(text("SET hnsw.ef_search = 400;"))
     
     sql = text("""
         SELECT
@@ -449,12 +491,24 @@ async def _vector_search(session: AsyncSession, qvec: List[float], limit: int) -
             s.embedding_text,
             s.embedding <=> CAST(:qvec AS vector) AS distance
         FROM lca.rag_lcia_semantic_index s
+        WHERE s.embedding IS NOT NULL
+          AND s.embedding <=> CAST(:qvec AS vector) < :max_dist
         ORDER BY distance ASC
         LIMIT :limit;
     """)
     
-    res = await session.execute(sql, {"qvec": vec_literal, "limit": limit})
-    return [dict(r) for r in res.mappings().all()]
+    res = await session.execute(sql, {
+        "qvec": vec_literal, 
+        "limit": limit,
+        "max_dist": max_distance
+    })
+    results = [dict(r) for r in res.mappings().all()]
+    
+    print(f"📊 _vector_search returned {len(results)} results (requested {limit}, max_distance={max_distance})")
+    if results:
+        print(f"   Distance range: {results[0]['distance']:.4f} ~ {results[-1]['distance']:.4f}")
+    
+    return results
 
 
 async def fetch_lcia_metadata_for_descriptions(
@@ -652,7 +706,7 @@ def calc_score_lcia_fast(
                 "score": 0.0,
                 "weight": 0.0,
                 "match_type": "none",
-                "description": "Keyword exact/fuzzy matching"
+                "description": "Keyword exact/fuzzy/tsvector matching"
             },
             "unit": {
                 "score": 0.0,
@@ -674,23 +728,43 @@ def calc_score_lcia_fast(
             score_details["semantic"]["description"] = "Two-stage retrieval: metadata (40%) + query (60%)"
         
         if ui.query_text:
-            query_keywords = set(normalize_text_field(ui.query_text).lower().split())
-            
-            lcia_name = row.get("lcia_name", "").lower()
-            
-            exact_match_bonus = 0.0
-            fuzzy_match_penalty = 0.0
-            
-            for keyword in query_keywords:
-                if keyword in lcia_name:
-                    exact_match_bonus += 0.3
-                    score_details["keyword_match"]["match_type"] = "exact"
-            
-            keyword_adjustment = exact_match_bonus + fuzzy_match_penalty
-            if keyword_adjustment != 0:
-                score += keyword_adjustment
-                score_details["keyword_match"]["score"] = keyword_adjustment
-                score_details["keyword_match"]["weight"] = abs(keyword_adjustment)
+            q_norm = normalize_text_field(ui.query_text)
+            if q_norm:
+                query_keywords = set(q_norm.lower().split())
+                
+                lcia_name = row.get("lcia_name", "").lower()
+                
+                exact_match_bonus = 0.0
+                fuzzy_match_penalty = 0.0
+                
+                for keyword in query_keywords:
+                    if keyword in lcia_name:
+                        exact_match_bonus += 0.3
+                        score_details["keyword_match"]["match_type"] = "exact"
+                
+                keyword_adjustment = exact_match_bonus + fuzzy_match_penalty
+                if keyword_adjustment != 0:
+                    score += keyword_adjustment
+                    score_details["keyword_match"]["score"] += keyword_adjustment
+                    score_details["keyword_match"]["weight"] += abs(keyword_adjustment)
+
+        kw_score = float(row.get("kw_score", 0.0) or 0.0)
+        if kw_score > 0.0:
+            KW_TSV_WEIGHT = 1.0
+            ts_boost = KW_TSV_WEIGHT * kw_score
+            score += ts_boost
+
+            score_details["keyword_match"]["score"] += ts_boost
+            score_details["keyword_match"]["weight"] += KW_TSV_WEIGHT
+
+            mt = score_details["keyword_match"]["match_type"]
+            if mt == "none":
+                score_details["keyword_match"]["match_type"] = "tsvector"
+            elif "tsvector" not in mt:
+                score_details["keyword_match"]["match_type"] = mt + "+tsvector"
+
+            score_details["keyword_match"]["tsvector_score"] = kw_score
+            score_details["keyword_match"]["tsvector_raw"] = kw_score / 100
 
         row_unit_id = str(row.get("unit_id")) if row.get("unit_id") else None
         ui_unit_id = str(ui.ref_unit_id) if ui.ref_unit_id else None
@@ -799,6 +873,8 @@ def print_scoring_details(rank: int, row: dict, score: float, details: dict):
         print(f"\n  🔑 Keyword Matching:")
         print(f"     • Match Type: {keyword.get('match_type', 'none')}")
         print(f"     • Score: {keyword.get('score', 0.0):.4f} (weight: {keyword.get('weight', 0.0):.2f})")
+        if "tsvector_score" in keyword:
+            print(f"     • tsvector raw score: {keyword.get('tsvector_score', 0.0):.4f}")
     
     unit = details.get("unit", {})
     print(f"\n  📏 Unit Matching:")
@@ -835,7 +911,7 @@ def to_lcia_card(row: dict) -> LciaCard:
         raise
 
 
-app = FastAPI(title="LEAF RAG LCIA Recommendations", version="0.8.5")
+app = FastAPI(title="LEAF RAG LCIA Recommendations", version="0.8.6-tsvector-hybrid")
 
 
 @app.post("/lcia/recommendations", response_model=RecommendResponse)
@@ -862,6 +938,21 @@ async def recommend(req: RecommendRequest):
             meta_rows = await fetch_lcia_metadata_for_descriptions(session, lcia_rows)
             if not meta_rows:
                 return RecommendResponse(items=[])
+
+            if should_use_keyword_channel(req.query_text):
+                print("  🧩 Keyword channel enabled (tsvector).")
+                candidate_ids = [str(r["lcia_description_id"]) for r in lcia_rows]
+                kw_scores = await keyword_scores_for_candidates(
+                    session,
+                    req.query_text or "",
+                    candidate_ids,
+                )
+                for r in meta_rows:
+                    did = str(r["lcia_description_id"])
+                    if did in kw_scores:
+                        r["kw_score"] = kw_scores[did]
+            else:
+                print("  🧩 Keyword channel skipped for this query.")
 
             metadata = await batch_load_metadata(session, meta_rows, req)
 
@@ -909,7 +1000,7 @@ async def recommend(req: RecommendRequest):
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "service": "LEAF RAG LCIA API", "version": "0.8.5"}
+    return {"status": "ok", "service": "LEAF RAG LCIA API", "version": "0.8.6-tsvector-hybrid"}
 
 
 if __name__ == "__main__":
