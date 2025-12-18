@@ -17,16 +17,114 @@ from sqlalchemy import text
 
 from sentence_transformers import SentenceTransformer
 
+# 🔥 Groq API
+from groq import Groq
+
 EMBED_DIM = 384
 _EMBED_MODEL: Optional[SentenceTransformer] = None
 
+# LLM Configuration
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+
+ENABLE_LLM_INTENT = True
+ENABLE_LLM_EXPLANATION = True
+LLM_TIMEOUT = 30.0
+
+# Groq 客户端
+_GROQ_CLIENT = None
+
+def get_groq_client():
+    """获取 Groq 客户端"""
+    global _GROQ_CLIENT
+    if _GROQ_CLIENT is None and GROQ_API_KEY:
+        _GROQ_CLIENT = Groq(api_key=GROQ_API_KEY)
+        print("✅ Groq API configured")
+    return _GROQ_CLIENT
 
 def get_embed_model() -> SentenceTransformer:
     global _EMBED_MODEL
     if _EMBED_MODEL is None:
+        print("🔧 Loading embedding model: intfloat/e5-small-v2")
         _EMBED_MODEL = SentenceTransformer("intfloat/e5-small-v2")
+        print("✅ Embedding model loaded")
     return _EMBED_MODEL
 
+
+def llm_generate(prompt: str, max_new_tokens: int = 256) -> str:
+    """
+    LLM 调用接口 - 使用 Groq API
+    """
+    try:
+        client = get_groq_client()
+        
+        if not client:
+            raise Exception("Groq client not initialized - please set GROQ_API_KEY")
+        
+        print(f"   🌐 Calling Groq API...")
+        
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant that outputs only JSON."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.1,
+            max_tokens=max_new_tokens,
+        )
+        
+        result = response.choices[0].message.content
+        
+        if not result:
+            raise Exception("Empty response from Groq API")
+        
+        print(f"   ✅ Groq API responded ({len(result)} chars)")
+        return result
+        
+    except Exception as e:
+        print(f"❌ Groq API error: {e}")
+        raise
+
+
+def extract_json_block(text: str) -> Optional[dict]:
+    """
+    从 LLM 回复里提取第一个 JSON 对象并解析
+    """
+    if not text:
+        return None
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    json_str = text[start:end+1]
+    try:
+        return json.loads(json_str)
+    except Exception:
+        return None
+
+def clean_llm_explanation(value: Any) -> Optional[str]:
+    """
+    从 LLM 返回值中提取纯文本解释
+    处理三种情况:
+    1. 直接字符串
+    2. 包含 reason_for_relevance 的字典
+    3. 其他结构化格式
+    """
+    if isinstance(value, str):
+        return value.strip()
+    
+    if isinstance(value, dict):
+        if "reason_for_relevance" in value:
+            return str(value["reason_for_relevance"]).strip()
+        
+        text_fields = [
+            v for v in value.values() 
+            if isinstance(v, str) and len(v) > 15
+        ]
+        
+        if text_fields:
+            return max(text_fields, key=len).strip()
+    
+    return None
 
 def none2str(x):
     return "" if x is None else str(x)
@@ -60,19 +158,17 @@ SessionLocal = async_sessionmaker(bind=engine, expire_on_commit=False, class_=As
 
 class Filters(BaseModel):
     database_ids: Optional[List[str]] = None
-    impact_method_ids: Optional[List[str]] = None
 
 
 class RecommendRequest(BaseModel):
     query_text: Optional[str] = ""
+    chat_text: Optional[str] = ""
     geography_id: Optional[str] = None
     ref_unit_id: Optional[str] = None
     query_lcia_name: Optional[str] = None
     query_upr_exchange_name: Optional[str] = None
     query_stage_name: Optional[str] = None
     query_process_name: Optional[str] = None
-    query_cpc_name: Optional[str] = None
-
     filters: Optional[Filters] = None
     topk: int = 10
 
@@ -95,6 +191,19 @@ class LciaCard(BaseModel):
 
 class RecommendResponse(BaseModel):
     items: List[dict]
+
+class LlmParsedMetadata(BaseModel):
+    query_lcia_name: Optional[str] = None
+    query_upr_exchange_name: Optional[str] = None
+    query_stage_name: Optional[str] = None
+    query_process_name: Optional[str] = None
+    geography_name: Optional[str] = None
+    ref_unit_name: Optional[str] = None
+    database_names: Optional[List[str]] = None
+    topk: Optional[int] = None
+
+    class Config:
+        extra = "ignore"
 
 
 _unit_conv_cache: Dict[tuple[str, str], bool] = {}
@@ -121,6 +230,82 @@ async def has_unit_conversion(session: AsyncSession, from_unit_id: str, to_unit_
         return ok
     except Exception as e:
         return False
+
+async def resolve_geography_id_by_name(session: AsyncSession, name: str) -> Optional[str]:
+    if not name:
+        return None
+    name = name.strip()
+    if not name:
+        return None
+
+    sql = text("""
+        SELECT id FROM lca.geography
+        WHERE LOWER(name) = LOWER(:name)
+        LIMIT 1
+    """)
+    res = await session.execute(sql, {"name": name})
+    row = res.first()
+    if row:
+        return str(row.id)
+
+    sql2 = text("""
+        SELECT id FROM lca.geography
+        WHERE name ILIKE :pat
+        ORDER BY name ASC
+        LIMIT 1
+    """)
+    res2 = await session.execute(sql2, {"pat": f"%{name}%"})
+    row2 = res2.first()
+    return str(row2.id) if row2 else None
+
+
+async def resolve_unit_id_by_name(session: AsyncSession, name: str) -> Optional[str]:
+    if not name:
+        return None
+    name = name.strip()
+    if not name:
+        return None
+
+    sql = text("""
+        SELECT id FROM lca.unit
+        WHERE LOWER(name) = LOWER(:name)
+        LIMIT 1
+    """)
+    res = await session.execute(sql, {"name": name})
+    row = res.first()
+    if row:
+        return str(row.id)
+
+    sql2 = text("""
+        SELECT id FROM lca.unit
+        WHERE name ILIKE :pat
+        ORDER BY name ASC
+        LIMIT 1
+    """)
+    res2 = await session.execute(sql2, {"pat": f"%{name}%"})
+    row2 = res2.first()
+    return str(row2.id) if row2 else None
+
+
+async def resolve_lcia_database_ids_by_names(
+    session: AsyncSession,
+    names: List[str],
+) -> List[str]:
+    if not names:
+        return []
+    clean_names = [n.strip() for n in names if n and n.strip()]
+    if not clean_names:
+        return []
+
+    sql = text("""
+        SELECT id, name
+        FROM lca.lcia_database
+        WHERE name ILIKE ANY(:patterns)
+    """)
+    patterns = [f"%{n}%" for n in clean_names]
+    res = await session.execute(sql, {"patterns": patterns})
+    rows = res.all()
+    return [str(r.id) for r in rows]
 
 
 async def get_geography_distance(session: AsyncSession, geo_a: str, geo_b: str) -> float:
@@ -348,6 +533,360 @@ async def keyword_scores_for_candidates(
         print(f"   score range: {min(scores.values()):.4f} ~ {max(scores.values()):.4f}")
     
     return scores
+
+async def enrich_request_with_llm_intent(
+    session: AsyncSession,
+    req: RecommendRequest,
+) -> RecommendRequest:
+    """
+    如果 chat_text 非空且启用了 LLM intent：用 LLM 解析用户诉求 → 补全 / 覆盖 RecommendRequest 的 metadata。
+    """
+    if not ENABLE_LLM_INTENT:
+        print("ℹ️ LLM intent parsing is disabled")
+        return req
+    
+    chat = normalize_text_field(req.chat_text)
+    if not chat:
+        return req
+
+    try:
+        async def _parse_intent():
+            system_prompt = """You are an assistant for an LCIA/EF recommendation system.
+
+Convert the user's request into structured search metadata.
+
+Return ONLY a JSON object. No markdown, no explanation.
+
+JSON schema:
+{
+  "query_lcia_name": string or null,
+  "query_upr_exchange_name": string or null,
+  "query_stage_name": string or null,
+  "query_process_name": string or null,
+  "geography_name": string or null,
+  "ref_unit_name": string or null,
+  "database_names": [string] or null,
+  "topk": integer or null
+}
+
+Use short names. If not specified, set to null."""
+
+            chat_trimmed = chat[:300] if len(chat) > 300 else chat
+            user_prompt = f"User request: {chat_trimmed}\n\nOutput JSON:"
+
+            full_prompt = system_prompt + "\n\n" + user_prompt
+
+            raw_output = await asyncio.to_thread(llm_generate, full_prompt, 200)
+            parsed_json = extract_json_block(raw_output)
+            if not parsed_json:
+                return None
+
+            return LlmParsedMetadata.model_validate(parsed_json)
+
+        parsed = await asyncio.wait_for(_parse_intent(), timeout=LLM_TIMEOUT)
+        
+        if not parsed:
+            print("⚠️ LLM intent parse failed, keep original request.")
+            return req
+
+        if parsed.query_lcia_name is not None:
+            req.query_lcia_name = parsed.query_lcia_name
+
+        if parsed.query_upr_exchange_name is not None:
+            req.query_upr_exchange_name = parsed.query_upr_exchange_name
+
+        if parsed.query_stage_name is not None:
+            req.query_stage_name = parsed.query_stage_name
+
+        if parsed.query_process_name is not None:
+            req.query_process_name = parsed.query_process_name
+
+        if parsed.geography_name:
+            geo_id = await resolve_geography_id_by_name(session, parsed.geography_name)
+            if geo_id:
+                req.geography_id = geo_id
+
+        if parsed.ref_unit_name:
+            unit_id = await resolve_unit_id_by_name(session, parsed.ref_unit_name)
+            if unit_id:
+                req.ref_unit_id = unit_id
+
+        db_ids: List[str] = []
+        if parsed.database_names:
+            db_ids = await resolve_lcia_database_ids_by_names(session, parsed.database_names)
+
+        if db_ids:
+            if req.filters is None:
+                req.filters = Filters()
+            req.filters.database_ids = db_ids
+
+        if parsed.topk and parsed.topk > 0:
+            req.topk = min(parsed.topk, 50)
+
+        print(f"✅ LLM intent parsing applied")
+        return req
+
+    except asyncio.TimeoutError:
+        print(f"⏱️ LLM intent parsing timeout ({LLM_TIMEOUT}s), using original request")
+        return req
+    except Exception as e:
+        print(f"⚠️ LLM intent parsing error: {e}, using original request")
+        return req
+
+async def llm_explain_results(
+    req: RecommendRequest,
+    topk_scored: List[tuple[float, dict, dict]],
+) -> Dict[str, str]:
+    """
+    混合策略:
+    1. LLM 生成语义匹配的解释 (从 LCA 角度)
+    2. Fallback 生成 unit/geography 的技术指标
+    3. 拼接两部分
+    """
+    if not ENABLE_LLM_EXPLANATION:
+        print("ℹ️ LLM explanation is disabled, using fallback")
+        return _fallback_explanations(topk_scored)
+    
+    if not topk_scored:
+        return {}
+
+    fallback_technical = _fallback_technical_info(topk_scored)
+    
+    try:
+        async def _generate_semantic_explanations():
+            query_context = {
+                "lcia_name": req.query_lcia_name or "",
+                "product": req.query_upr_exchange_name or "",
+                "stage": req.query_stage_name or "",
+                "process": req.query_process_name or "",
+            }
+            
+            items_for_llm = []
+            id_map = {}
+            
+            for score, row, details in topk_scored:
+                desc_id = str(row.get("lcia_description_id"))
+                
+                item = {
+                    "id": desc_id,
+                    "lcia_name": (row.get("lcia_name") or "")[:100],
+                    "product": (row.get("upr_exchange_name") or "")[:60],
+                    "stage": (row.get("stage_name") or "")[:80],
+                    "process": (row.get("process_name") or "")[:80],
+                }
+                
+                items_for_llm.append(item)
+                id_map[desc_id] = row.get("lcia_name", "Unknown")
+
+            prompt = f"""You are an LCA expert. For each matched dataset, explain its LCA relevance to the query.
+
+USER QUERY (what they need):
+- LCIA: {query_context['lcia_name']}
+- Product: {query_context['product']}
+- Stage: {query_context['stage']}
+- Process: {query_context['process']}
+
+MATCHED DATASETS:
+{json.dumps(items_for_llm, ensure_ascii=False, indent=2)}
+
+TASK:
+For EACH dataset, write ONE independent explanation (15-25 words) from an LCA perspective.
+
+CRITICAL RULES:
+1. Each explanation is INDEPENDENT - do not reference other datasets ("similar to", "like the first", etc.)
+2. Use POSITIVE language - explain what the match DOES provide, not what it lacks
+3. Focus on LCA relationships:
+   - How matched product supports query product
+   - How matched stage/process relates to query stage/process
+   - Why this is valuable for LCA analysis
+
+AVOID:
+- Negative phrases: "not explicitly", "although not", "while lacking", "does not"
+- Comparative phrases: "similar to", "like the previous", "as with"
+- Apologetic tone: "might", "could", "possibly"
+
+GOOD EXAMPLES:
+✅ "Provides high-voltage electricity infrastructure supporting aluminium smelting operations."
+✅ "Natural gas electricity generation directly powers the smelting stage energy requirements."
+✅ "Market data for electricity distribution informs the power supply chain in metal production."
+
+BAD EXAMPLES:
+❌ "Similar to the first match, this dataset..."
+❌ "While not explicitly matching the exact stages..."
+❌ "Although not directly related to smelting..."
+
+Output ONLY JSON with dataset IDs as keys and explanation strings as values:
+{{
+  "dataset-id-1": "Explanation text here",
+  "dataset-id-2": "Explanation text here"
+}}
+
+No markdown. Start with {{
+
+JSON:"""
+
+            print(f"\n🤖 Requesting LLM semantic explanations for {len(items_for_llm)} items")
+
+            raw_output = await asyncio.to_thread(llm_generate, prompt, 1200)
+            
+            print(f"🤖 LLM output: {len(raw_output)} chars")
+            print(f"   Preview: {raw_output[:300]}...")
+            
+            parsed = extract_json_block(raw_output)
+
+            raw_output = raw_output.replace("```json", "").replace("```", "").strip()
+
+            if not parsed:
+                print("❌ Failed to parse JSON")
+                return None
+            
+            def clean_explanation(value: Any) -> Optional[str]:
+                """提取纯文本解释"""
+                if isinstance(value, str):
+                    return value.strip()
+                
+                if isinstance(value, dict):
+                    if "reason_for_relevance" in value:
+                        return str(value["reason_for_relevance"]).strip()
+                    
+                    text_fields = [
+                        v for v in value.values() 
+                        if isinstance(v, str) and len(v) > 15
+                    ]
+                    if text_fields:
+                        return max(text_fields, key=len).strip()
+                
+                return None
+            
+            cleaned_parsed = {}
+            for desc_id, value in parsed.items():
+                clean_text = clean_explanation(value)
+                if clean_text:
+                    cleaned_parsed[desc_id] = clean_text
+            
+            matched = sum(1 for k in parsed.keys() if k in id_map)
+            print(f"   Matched: {matched}/{len(items_for_llm)}")
+            
+            if len(items_for_llm) > 0 and matched / len(items_for_llm) < 0.5:
+                print(f"   ⚠️ Low match rate ({matched}/{len(items_for_llm)}), using fallback")
+                return None
+            
+            return parsed if isinstance(parsed, dict) else None
+
+        llm_semantic = await asyncio.wait_for(_generate_semantic_explanations(), timeout=120.0)
+        
+        if llm_semantic and len(llm_semantic) > 0:
+            print(f"✅ LLM semantic OK - Got {len(llm_semantic)} explanations")
+            
+            final_explanations = {}
+            for desc_id, technical_info in fallback_technical.items():
+                semantic_part = llm_semantic.get(desc_id, "")
+                if semantic_part:
+                    final_explanations[desc_id] = f"{semantic_part} {technical_info}"
+                else:
+                    final_explanations[desc_id] = f"Relevant LCA dataset. {technical_info}"
+            
+            return final_explanations
+        else:
+            print("⚠️ LLM returned empty, using pure fallback")
+            return _fallback_explanations(topk_scored)
+    
+    except asyncio.TimeoutError:
+        print(f"⏱️ LLM timeout (120s), using pure fallback")
+        return _fallback_explanations(topk_scored)
+    except Exception as e:
+        print(f"❌ LLM error: {e}")
+        return _fallback_explanations(topk_scored)
+
+
+def _fallback_technical_info(topk_scored: List[tuple[float, dict, dict]]) -> Dict[str, str]:
+    """生成 unit/geography 的技术指标说明(用于拼接到 LLM 语义解释后面)"""
+    result = {}
+    for score, row, details in topk_scored:
+        desc_id = str(row.get("lcia_description_id"))
+        
+        parts = []
+        
+        unit_match = details.get("unit", {}).get("match_type", "no_match")
+        if unit_match == "exact_match":
+            parts.append("Exact unit (kWh)")
+        elif unit_match == "convertible":
+            parts.append("Convertible units")
+        elif unit_match == "same_type":
+            parts.append("Same unit type")
+        
+        geo_score = details.get("geography", {}).get("score", 0)
+        if geo_score >= 1.0:
+            parts.append("exact geography")
+        elif geo_score >= 0.75:
+            parts.append("close geography (1 level)")
+        elif geo_score >= 0.55:
+            parts.append("related geography (2 levels)")
+        elif geo_score >= 0.40:
+            parts.append("broader geography (3 levels)")
+        elif geo_score > 0.2:
+            parts.append("common region")
+        
+        if parts:
+            result[desc_id] = f"{'. '.join(parts)}."
+        else:
+            result[desc_id] = ""
+    
+    return result
+
+
+def _fallback_explanations(topk_scored: List[tuple[float, dict, dict]]) -> Dict[str, str]:
+    """生成专业的基于规则的 LCA 解释"""
+    result = {}
+    for score, row, details in topk_scored:
+        desc_id = str(row.get("lcia_description_id"))
+        
+        parts = []
+        
+        sem_score = details.get("semantic", {}).get("score", 0)
+        if sem_score > 4.5:
+            parts.append("Strong semantic alignment with query requirements")
+        elif sem_score > 4.0:
+            parts.append("Good semantic relevance to query")
+        else:
+            parts.append("Moderate semantic match")
+        
+        unit_match = details.get("unit", {}).get("match_type", "no_match")
+        if unit_match == "exact_match":
+            parts.append("exact unit match (kWh)")
+        elif unit_match == "convertible":
+            parts.append("convertible units (compatible measurement)")
+        elif unit_match == "same_type":
+            parts.append("same unit type (energy)")
+        elif unit_match == "same_type_and_system":
+            parts.append("compatible unit system")
+        
+        geo_match = details.get("geography", {}).get("match_type", "not_specified")
+        geo_score = details.get("geography", {}).get("score", 0)
+        
+        if geo_score >= 1.0:
+            parts.append("exact geographic match")
+        elif geo_score >= 0.75:
+            parts.append("close geographic proximity (1 level in hierarchy)")
+        elif geo_score >= 0.55:
+            parts.append("related geography (2 levels apart)")
+        elif geo_score >= 0.40:
+            parts.append("broader geographic scope (3 levels)")
+        elif geo_score > 0.2:
+            parts.append("common geographic region")
+        
+        kw_match = details.get("keyword_match", {}).get("match_type", "none")
+        if "tsvector" in kw_match:
+            parts.append("keyword alignment")
+        
+        if len(parts) >= 2:
+            explanation = f"{parts[0]}. {', '.join(parts[1:])}."
+        else:
+            explanation = f"Relevant match (total score: {score:.2f}). {parts[0] if parts else 'Meets search criteria'}."
+        
+        result[desc_id] = explanation
+    
+    return result
 
 async def build_query_embedding_v2(
     session: AsyncSession,
@@ -891,8 +1430,7 @@ def print_scoring_details(rank: int, row: dict, score: float, details: dict):
     print(f"  💯 Total Score: {details.get('total', 0.0):.4f}")
     print("=" * 80)
 
-
-def to_lcia_card(row: dict) -> LciaCard:
+def to_lcia_card(row: dict, explain: Optional[str] = None) -> LciaCard:
     try:
         return LciaCard(
             type="EF",
@@ -905,19 +1443,42 @@ def to_lcia_card(row: dict) -> LciaCard:
             unit_name=row.get("unit_name"),
             stage_name=row.get("stage_name"),
             process_name=row.get("process_name"),
-            explain="Based on LCIA description semantic retrieval + weighted ranking of multi-dimensional rules such as units/regions",
+            explain=explain or "Based on LCIA description semantic retrieval + weighted ranking of multi-dimensional rules such as units/regions",
         )
     except Exception as e:
         raise
 
 
-app = FastAPI(title="LEAF RAG LCIA Recommendations", version="0.8.6-tsvector-hybrid")
+
+app = FastAPI(title="LEAF RAG LCIA Recommendations", version="1.0.0-groq-only")
+
+@app.on_event("startup")
+async def startup_event():
+    """应用启动时预加载模型"""
+    print("🚀 Initializing LCIA Recommendation API...")
+    print(f"   • LLM Intent: {'✅ Enabled' if ENABLE_LLM_INTENT else '❌ Disabled'}")
+    print(f"   • LLM Explanation: {'✅ Enabled' if ENABLE_LLM_EXPLANATION else '❌ Disabled'}")
+    print(f"   • LLM Timeout: {LLM_TIMEOUT}s")
+    print(f"   • LLM Provider: 🌐 Groq API (llama-3.3-70b-versatile)")
+    
+    # 初始化 Groq 客户端
+    if not GROQ_API_KEY:
+        print("   ⚠️  WARNING: GROQ_API_KEY not set - LLM features will fail")
+    else:
+        get_groq_client()
+    
+    # 预加载 embedding 模型
+    await asyncio.to_thread(get_embed_model)
+    
+    print("✅ API ready")
 
 
 @app.post("/lcia/recommendations", response_model=RecommendResponse)
 async def recommend(req: RecommendRequest):
     try:
         async with SessionLocal() as session:
+            req = await enrich_request_with_llm_intent(session, req)
+
             metadata_vec, query_vec, semantic_text = await build_query_embedding_v2(session, req)
             
             print(f"\n🔍 Query Analysis:")
@@ -988,7 +1549,22 @@ async def recommend(req: RecommendRequest):
         for rank, (score, row, details) in enumerate(topk_results, 1):
             print_scoring_details(rank, row, score, details)
 
-        cards = [to_lcia_card(r) for (s, r, d) in topk_results]
+        explanations_map: Dict[str, str] = await llm_explain_results(req, topk_results)
+
+        print(f"\n📝 Explanations map has {len(explanations_map)} entries")
+        if explanations_map:
+            print(f"   Sample keys: {list(explanations_map.keys())[:3]}")
+
+        cards = []
+        for (score, row, details) in topk_results:
+            did = str(row["lcia_description_id"])
+            exp = explanations_map.get(did)
+            if exp:
+                print(f"✅ Found explanation for {did[:8]}...")
+            else:
+                print(f"⚠️ No explanation for {did[:8]}..., using default")
+            cards.append(to_lcia_card(row, explain=exp))
+
         return RecommendResponse(items=[c.model_dump() for c in cards])
 
     except HTTPException:
@@ -997,10 +1573,18 @@ async def recommend(req: RecommendRequest):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "service": "LEAF RAG LCIA API", "version": "0.8.6-tsvector-hybrid"}
+    return {
+        "status": "ok", 
+        "service": "LEAF RAG LCIA API", 
+        "version": "1.0.0-groq-only",
+        "llm_provider": "Groq API (llama-3.3-70b-versatile)",
+        "llm_intent_enabled": ENABLE_LLM_INTENT,
+        "llm_explanation_enabled": ENABLE_LLM_EXPLANATION,
+        "llm_timeout": LLM_TIMEOUT,
+        "groq_configured": GROQ_API_KEY is not None
+    }
 
 
 if __name__ == "__main__":
