@@ -53,6 +53,9 @@ def get_embed_model() -> SentenceTransformer:
 def llm_generate(prompt: str, max_new_tokens: int = 256) -> str:
     """
     LLM 调用接口 - 使用 Groq API
+    当前约定：
+    - system message 固定为 “You are a helpful assistant that outputs only JSON.”
+    - user message 放完整 prompt（包含 schema、说明等）
     """
     try:
         client = get_groq_client()
@@ -539,7 +542,11 @@ async def enrich_request_with_llm_intent(
     req: RecommendRequest,
 ) -> RecommendRequest:
     """
-    如果 chat_text 非空且启用了 LLM intent：用 LLM 解析用户诉求 → 补全 / 覆盖 RecommendRequest 的 metadata。
+    LLM Input：从 chat_text + 现有 query_* 字段 → 结构化 metadata（含 unit/geography/database/topk）
+
+    - 只在 chat_text 非空且 ENABLE_LLM_INTENT = True 时触发
+    - LLM 输出 JSON → LlmParsedMetadata
+    - 再从 PG 解析 unit/geography/database 的 ID，更新 RecommendRequest
     """
     if not ENABLE_LLM_INTENT:
         print("ℹ️ LLM intent parsing is disabled")
@@ -551,13 +558,21 @@ async def enrich_request_with_llm_intent(
 
     try:
         async def _parse_intent():
-            system_prompt = """You are an assistant for an LCIA/EF recommendation system.
+            system_prompt = """
+You are an assistant for a Life Cycle Assessment (LCA) EF/LCIA recommendation system.
 
-Convert the user's request into structured search metadata.
+Your goal is to convert the user's request into structured search metadata that can be used
+to find suitable LCIA/EF datasets (e.g. from ecoinvent).
 
-Return ONLY a JSON object. No markdown, no explanation.
+Interpret the request from an LCA perspective and infer, if possible:
+- The LCIA impact category or process name to search for
+- The reference product / flow name (upr_exchange_name)
+- The life cycle stage (e.g. smelting, manufacturing, use, end-of-life)
+- The specific process name (e.g. "market for electricity, high voltage, aluminium industry")
+- A reasonable unit and geography, if the user hints at them
+- Any LCIA database names and a suitable top-k value
 
-JSON schema:
+Return ONLY one JSON object with this exact schema:
 {
   "query_lcia_name": string or null,
   "query_upr_exchange_name": string or null,
@@ -566,17 +581,37 @@ JSON schema:
   "geography_name": string or null,
   "ref_unit_name": string or null,
   "database_names": [string] or null,
-  "topk": integer or null
+  "topk": null
 }
 
-Use short names. If not specified, set to null."""
+Rules:
+- Use short English phrases, close to ecoinvent naming style.
+- If you are not sure about a field, set it to null.
+- ALWAYS set topk to null - do not infer the number of results.
+- Do NOT invent detailed technical parameters (e.g. energy mix, exact fuel shares).
+- Do NOT output any text outside the single JSON object.
+"""
 
-            chat_trimmed = chat[:300] if len(chat) > 300 else chat
-            user_prompt = f"User request: {chat_trimmed}\n\nOutput JSON:"
+            chat_trimmed = chat[:800] if len(chat) > 800 else chat
+            payload = {
+                "chat_text": chat_trimmed,
+                "current_query_lcia_name": req.query_lcia_name,
+                "current_query_upr_exchange_name": req.query_upr_exchange_name,
+                "current_query_stage_name": req.query_stage_name,
+                "current_query_process_name": req.query_process_name,
+            }
+
+            user_prompt = (
+                "Here is the user input and current structured query fields:\n\n"
+                f"{json.dumps(payload, ensure_ascii=False, indent=2)}\n\n"
+                "Based on this, produce ONE JSON object following the schema above.\n"
+                "If a field is not specified or cannot be inferred, set it to null.\n"
+                "JSON:"
+            )
 
             full_prompt = system_prompt + "\n\n" + user_prompt
 
-            raw_output = await asyncio.to_thread(llm_generate, full_prompt, 200)
+            raw_output = await asyncio.to_thread(llm_generate, full_prompt, 400)
             parsed_json = extract_json_block(raw_output)
             if not parsed_json:
                 return None
@@ -589,6 +624,7 @@ Use short names. If not specified, set to null."""
             print("⚠️ LLM intent parse failed, keep original request.")
             return req
 
+        # 覆盖 / 补全 query_* 四个字段
         if parsed.query_lcia_name is not None:
             req.query_lcia_name = parsed.query_lcia_name
 
@@ -601,6 +637,7 @@ Use short names. If not specified, set to null."""
         if parsed.query_process_name is not None:
             req.query_process_name = parsed.query_process_name
 
+        # 地理 & 单位（通过名称解析 ID）
         if parsed.geography_name:
             geo_id = await resolve_geography_id_by_name(session, parsed.geography_name)
             if geo_id:
@@ -611,6 +648,7 @@ Use short names. If not specified, set to null."""
             if unit_id:
                 req.ref_unit_id = unit_id
 
+        # 数据库过滤
         db_ids: List[str] = []
         if parsed.database_names:
             db_ids = await resolve_lcia_database_ids_by_names(session, parsed.database_names)
@@ -619,9 +657,6 @@ Use short names. If not specified, set to null."""
             if req.filters is None:
                 req.filters = Filters()
             req.filters.database_ids = db_ids
-
-        if parsed.topk and parsed.topk > 0:
-            req.topk = min(parsed.topk, 50)
 
         print(f"✅ LLM intent parsing applied")
         return req
@@ -633,15 +668,96 @@ Use short names. If not specified, set to null."""
         print(f"⚠️ LLM intent parsing error: {e}, using original request")
         return req
 
+def _build_lcia_context_sentence(
+    lcia_name: Optional[str],
+    upr_exchange_name: Optional[str],
+    stage_name: Optional[str],
+    process_name: Optional[str],
+) -> str:
+    """
+    把 lcia_name / upr_exchange_name / stage_name / process_name 组合成一条简洁的 LCA 语境句，
+    方便 LLM 快速理解整体含义，但不替代结构化字段。
+    """
+    parts = []
+
+    lcia = (lcia_name or "").strip()
+    upr = (upr_exchange_name or "").strip()
+    stage = (stage_name or "").strip()
+    proc = (process_name or "").strip()
+
+    if upr:
+        parts.append(f"reference product \"{upr}\"")
+    if stage:
+        parts.append(f"life cycle stage \"{stage}\"")
+    if proc:
+        parts.append(f"process \"{proc}\"")
+
+    if lcia:
+        head = f"LCIA dataset \"{lcia}\""
+    else:
+        head = "LCIA dataset"
+
+    if parts:
+        return head + " modelling " + ", ".join(parts)
+    else:
+        return head
+
+
+def _normalize_product_name(name: Optional[str]) -> str:
+    """
+    取产品名的“主干”：小写 + 去掉逗号后面部分 + 去掉非字母数字。
+    例如：
+      "Tomato, fresh grade" -> "tomato"
+      "electricity, high voltage, aluminium industry" -> "electricity high voltage aluminium industry"
+    """
+    if not name:
+        return ""
+    s = str(name).lower()
+    # 只取第一个逗号前面的主产品部分（作物场景很有用）
+    s = s.split(",")[0]
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    return s.strip()
+
+
+def _product_match_label(query_product: Optional[str], candidate_product: Optional[str]) -> str:
+    """
+    粗略判定产品匹配程度：
+      - exact: 主名几乎一样（相等或一个包含另一个）
+      - overlap: 有词交集（例如 "tomato fresh" vs "tomato canned"）
+      - different: 完全不同（番茄 vs 玉米、葡萄等）
+      - unknown: 缺字段
+    """
+    q = _normalize_product_name(query_product)
+    c = _normalize_product_name(candidate_product)
+
+    if not q or not c:
+        return "unknown"
+
+    if q == c or q in c or c in q:
+        return "exact"
+
+    q_tokens = set(q.split())
+    c_tokens = set(c.split())
+    if q_tokens & c_tokens:
+        return "overlap"
+
+    return "different"
+
 async def llm_explain_results(
     req: RecommendRequest,
     topk_scored: List[tuple[float, dict, dict]],
 ) -> Dict[str, str]:
     """
-    混合策略:
-    1. LLM 生成语义匹配的解释 (从 LCA 角度)
-    2. Fallback 生成 unit/geography 的技术指标
-    3. 拼接两部分
+    LLM Output：解释为什么匹配（专注 LCA 语义）
+
+    新逻辑：
+    1. 在 Python 里先计算 product_match_label（exact / overlap / different / unknown）；
+    2. LLM 只做“语义解释”，但必须根据 product_match_label 说明：
+       - exact: 主匹配，直接对应用户要的产品/过程；
+       - overlap: 近似产品，说明相关性；
+       - different: 不同作物/产品，只能作为 proxy / 参考；
+    3. unit / geography 的解释仍由 _fallback_technical_info 基于规则拼接；
+    4. 如果 LLM 失败或覆盖率太低，则纯规则 fallback。
     """
     if not ENABLE_LLM_EXPLANATION:
         print("ℹ️ LLM explanation is disabled, using fallback")
@@ -650,80 +766,127 @@ async def llm_explain_results(
     if not topk_scored:
         return {}
 
+    # 规则侧 unit/geo 解释
     fallback_technical = _fallback_technical_info(topk_scored)
     
     try:
         async def _generate_semantic_explanations():
+            # 构造用户意图的结构化 + 组合句
             query_context = {
                 "lcia_name": req.query_lcia_name or "",
-                "product": req.query_upr_exchange_name or "",
-                "stage": req.query_stage_name or "",
-                "process": req.query_process_name or "",
+                "upr_exchange_name": req.query_upr_exchange_name or "",
+                "stage_name": req.query_stage_name or "",
+                "process_name": req.query_process_name or "",
+                "combined_text": _build_lcia_context_sentence(
+                    req.query_lcia_name,
+                    req.query_upr_exchange_name,
+                    req.query_stage_name,
+                    req.query_process_name,
+                ),
             }
             
             items_for_llm = []
-            id_map = {}
-            
+            expected_ids = set()
+
             for score, row, details in topk_scored:
                 desc_id = str(row.get("lcia_description_id"))
-                
+                expected_ids.add(desc_id)
+
+                product_match = _product_match_label(
+                    req.query_upr_exchange_name,
+                    row.get("upr_exchange_name"),
+                )
+
+                lcia_name = (row.get("lcia_name") or "")[:160]
+                upr_name = (row.get("upr_exchange_name") or "")[:120]
+                stage_name = (row.get("stage_name") or "")[:160]
+                process_name = (row.get("process_name") or "")[:160]
+
                 item = {
                     "id": desc_id,
-                    "lcia_name": (row.get("lcia_name") or "")[:100],
-                    "product": (row.get("upr_exchange_name") or "")[:60],
-                    "stage": (row.get("stage_name") or "")[:80],
-                    "process": (row.get("process_name") or "")[:80],
+                    "lcia_name": lcia_name,
+                    "upr_exchange_name": upr_name,
+                    "stage_name": stage_name,
+                    "process_name": process_name,
+                    "product_match_label": product_match,
+                    # 👇 新增：组合句，辅助 LLM 理解整体语境
+                    "combined_text": _build_lcia_context_sentence(
+                        lcia_name,
+                        upr_name,
+                        stage_name,
+                        process_name,
+                    ),
                 }
-                
                 items_for_llm.append(item)
-                id_map[desc_id] = row.get("lcia_name", "Unknown")
 
-            prompt = f"""You are an LCA expert. For each matched dataset, explain its LCA relevance to the query.
 
-USER QUERY (what they need):
-- LCIA: {query_context['lcia_name']}
-- Product: {query_context['product']}
-- Stage: {query_context['stage']}
-- Process: {query_context['process']}
+            prompt = f"""
+You are an LCA/LCIA expert explanation assistant.
 
-MATCHED DATASETS:
+The system has already selected candidate EF/LCIA datasets using semantic retrieval and rule-based scoring.
+Your task is ONLY to explain, from an LCA perspective, why each candidate is relevant (or how it can be used)
+for the user's modelling intent, based on the naming of LCIA, reference product, stage and process.
+
+USER INTENT (structured fields and combined_text summary):
+{json.dumps(query_context, ensure_ascii=False, indent=2)}
+
+CANDIDATE DATASETS (one item per LCIA description, with structured fields and combined_text):
 {json.dumps(items_for_llm, ensure_ascii=False, indent=2)}
 
-TASK:
-For EACH dataset, write ONE independent explanation (15-25 words) from an LCA perspective.
 
-CRITICAL RULES:
-1. Each explanation is INDEPENDENT - do not reference other datasets ("similar to", "like the first", etc.)
-2. Use POSITIVE language - explain what the match DOES provide, not what it lacks
-3. Focus on LCA relationships:
-   - How matched product supports query product
-   - How matched stage/process relates to query stage/process
-   - Why this is valuable for LCA analysis
+IMPORTANT FIELD:
+- product_match_label:
+  - "exact": same core product as the user intent (e.g. "tomato, fresh grade" vs "tomato production, fresh grade").
+  - "overlap": closely related product wording with shared tokens (e.g. different variants of the same product).
+  - "different": clearly different product/crop (e.g. tomato vs maize, grape, chickpea, bell pepper).
+  - "unknown": insufficient information.
 
-AVOID:
-- Negative phrases: "not explicitly", "although not", "while lacking", "does not"
-- Comparative phrases: "similar to", "like the previous", "as with"
-- Apologetic tone: "might", "could", "possibly"
+FOR EACH DATASET, write ONE independent English explanation (about 15–25 words) that:
+
+1. Focuses on how lcia_name / upr_exchange_name / stage_name / process_name relate to the user's intent.
+2. Clearly reflects product_match_label:
+   - If "exact": emphasise that this is a direct match for the requested product/process within the life cycle.
+   - If "overlap": describe it as a closely related variant of the requested product, explaining the relation.
+   - If "different": explicitly state that it models a different product/crop, and can only serve as a proxy or
+     comparison dataset when no exact data are available.
+3. Indicate whether it represents a market, production process, or supporting process within the life cycle
+   (based ONLY on the wording of the names, e.g. "market for...", "production", "voltage transformation").
+4. Use positive, concise language that LCA practitioners can understand.
+
+STRICT RULES:
+- Each explanation is INDEPENDENT. Do NOT reference other datasets
+  (avoid phrases like "similar to the previous one", "like the first match").
+- Do NOT mention units or geography — these will be explained separately.
+- Base your reasoning ONLY on the strings provided in the fields and product_match_label.
+  Do NOT invent fuels, technologies, energy mixes or parameters that are not explicitly named.
+- Avoid negative or apologetic language such as:
+  "although not exactly", "not explicitly", "might be", "possibly".
+- Do NOT talk about model versions, databases, or numerical scores.
 
 GOOD EXAMPLES:
-✅ "Provides high-voltage electricity infrastructure supporting aluminium smelting operations."
-✅ "Natural gas electricity generation directly powers the smelting stage energy requirements."
-✅ "Market data for electricity distribution informs the power supply chain in metal production."
+- (product_match_label = "exact")
+  "Directly models tomato production, fresh grade in open-field systems, matching the requested crop and management stage."
+- (product_match_label = "different")
+  "Represents maize grain production in similar field-based systems and can serve as a proxy when tomato-specific data are unavailable."
+- (electricity example)
+  "Provides high-voltage electricity specifically for aluminium industry operations, supporting energy demand in smelting and related stages."
 
 BAD EXAMPLES:
-❌ "Similar to the first match, this dataset..."
-❌ "While not explicitly matching the exact stages..."
-❌ "Although not directly related to smelting..."
+- "Similar to the first dataset, this one..."
+- "While not explicitly matching the smelting stage..."
+- "This might be relevant if the process uses hydro power..."
 
-Output ONLY JSON with dataset IDs as keys and explanation strings as values:
+OUTPUT FORMAT:
+Return ONLY a single JSON object mapping dataset IDs to explanation strings:
+
 {{
   "dataset-id-1": "Explanation text here",
   "dataset-id-2": "Explanation text here"
 }}
 
-No markdown. Start with {{
-
-JSON:"""
+Do NOT output markdown. Do NOT add comments. Start directly with '{{'.
+JSON:
+"""
 
             print(f"\n🤖 Requesting LLM semantic explanations for {len(items_for_llm)} items")
 
@@ -731,64 +894,56 @@ JSON:"""
             
             print(f"🤖 LLM output: {len(raw_output)} chars")
             print(f"   Preview: {raw_output[:300]}...")
-            
-            parsed = extract_json_block(raw_output)
 
-            raw_output = raw_output.replace("```json", "").replace("```", "").strip()
+            # 清理可能的 ```json 包裹
+            raw_output_clean = raw_output.replace("```json", "").replace("```", "").strip()
+            parsed = extract_json_block(raw_output_clean)
 
-            if not parsed:
-                print("❌ Failed to parse JSON")
+            if not parsed or not isinstance(parsed, dict):
+                print("❌ Failed to parse JSON from LLM output")
                 return None
             
-            def clean_explanation(value: Any) -> Optional[str]:
-                """提取纯文本解释"""
-                if isinstance(value, str):
-                    return value.strip()
-                
-                if isinstance(value, dict):
-                    if "reason_for_relevance" in value:
-                        return str(value["reason_for_relevance"]).strip()
-                    
-                    text_fields = [
-                        v for v in value.values() 
-                        if isinstance(v, str) and len(v) > 15
-                    ]
-                    if text_fields:
-                        return max(text_fields, key=len).strip()
-                
-                return None
-            
-            cleaned_parsed = {}
+            # 清洗解释文本
+            cleaned_parsed: Dict[str, str] = {}
             for desc_id, value in parsed.items():
-                clean_text = clean_explanation(value)
-                if clean_text:
-                    cleaned_parsed[desc_id] = clean_text
+                text = clean_llm_explanation(value)
+                if text:
+                    cleaned_parsed[desc_id] = text
+
+            # 匹配率检查：至少一半候选有解释才算 OK
+            matched = sum(1 for did in expected_ids if did in cleaned_parsed)
+            total = len(expected_ids)
+            print(f"   Matched explanations: {matched}/{total}")
             
-            matched = sum(1 for k in parsed.keys() if k in id_map)
-            print(f"   Matched: {matched}/{len(items_for_llm)}")
-            
-            if len(items_for_llm) > 0 and matched / len(items_for_llm) < 0.5:
-                print(f"   ⚠️ Low match rate ({matched}/{len(items_for_llm)}), using fallback")
+            if total > 0 and matched / total < 0.5:
+                print(f"   ⚠️ Low explanation coverage ({matched}/{total}), falling back to rule-only explanations")
                 return None
             
-            return parsed if isinstance(parsed, dict) else None
+            return cleaned_parsed
 
         llm_semantic = await asyncio.wait_for(_generate_semantic_explanations(), timeout=120.0)
         
         if llm_semantic and len(llm_semantic) > 0:
             print(f"✅ LLM semantic OK - Got {len(llm_semantic)} explanations")
             
-            final_explanations = {}
-            for desc_id, technical_info in fallback_technical.items():
-                semantic_part = llm_semantic.get(desc_id, "")
-                if semantic_part:
-                    final_explanations[desc_id] = f"{semantic_part} {technical_info}"
+            final_explanations: Dict[str, str] = {}
+            for score, row, details in topk_scored:
+                did = str(row["lcia_description_id"])
+                semantic_part = llm_semantic.get(did, "")
+                technical_part = fallback_technical.get(did, "").strip()
+                
+                if semantic_part and technical_part:
+                    final_explanations[did] = f"{semantic_part} {technical_part}"
+                elif semantic_part:
+                    final_explanations[did] = semantic_part
+                elif technical_part:
+                    final_explanations[did] = f"Relevant LCIA dataset. {technical_part}"
                 else:
-                    final_explanations[desc_id] = f"Relevant LCA dataset. {technical_info}"
+                    final_explanations[did] = "Relevant LCIA dataset selected by semantic retrieval and rule-based scoring."
             
             return final_explanations
         else:
-            print("⚠️ LLM returned empty, using pure fallback")
+            print("⚠️ LLM returned empty or invalid explanations, using pure fallback")
             return _fallback_explanations(topk_scored)
     
     except asyncio.TimeoutError:
@@ -800,48 +955,72 @@ JSON:"""
 
 
 def _fallback_technical_info(topk_scored: List[tuple[float, dict, dict]]) -> Dict[str, str]:
-    """生成 unit/geography 的技术指标说明(用于拼接到 LLM 语义解释后面)"""
-    result = {}
-    for score, row, details in topk_scored:
+    """
+    仅基于 unit / geography 打分细节生成技术说明片段，拼接在 LLM 语义解释后面。
+    不涉及语义匹配，只解释：
+    - 单位是否精确匹配 / 可转换 / 同类型；
+    - 地理是否精确 / 上下游层级 / 共同祖先 / 更广区域。
+    """
+    result: Dict[str, str] = {}
+    for _, row, details in topk_scored:
         desc_id = str(row.get("lcia_description_id"))
-        
-        parts = []
-        
-        unit_match = details.get("unit", {}).get("match_type", "no_match")
+        parts: List[str] = []
+
+        # 单位解释
+        unit_info = details.get("unit", {})
+        unit_match = unit_info.get("match_type", "no_match")
+        unit_name = row.get("unit_name")
+
         if unit_match == "exact_match":
-            parts.append("Exact unit (kWh)")
+            if unit_name:
+                parts.append(f"Unit exactly matches ({unit_name}).")
+            else:
+                parts.append("Unit exactly matches.")
         elif unit_match == "convertible":
-            parts.append("Convertible units")
-        elif unit_match == "same_type":
-            parts.append("Same unit type")
-        
-        geo_score = details.get("geography", {}).get("score", 0)
-        if geo_score >= 1.0:
-            parts.append("exact geography")
-        elif geo_score >= 0.75:
-            parts.append("close geography (1 level)")
-        elif geo_score >= 0.55:
-            parts.append("related geography (2 levels)")
-        elif geo_score >= 0.40:
-            parts.append("broader geography (3 levels)")
-        elif geo_score > 0.2:
-            parts.append("common region")
-        
-        if parts:
-            result[desc_id] = f"{'. '.join(parts)}."
-        else:
-            result[desc_id] = ""
-    
+            parts.append(f"Unit is directly convertible to ({unit_name}).")
+        elif unit_match in ("same_type", "same_type_and_system"):
+            parts.append("Unit measures the same physical quantity and is convertible.")
+        elif unit_match == "same_system":
+            parts.append("Unit is in the same unit system and convertible.")
+        # 地理解释
+        geo_info = details.get("geography", {})
+        geo_match = geo_info.get("match_type")
+        geo_score = geo_info.get("score", 0.0)
+        geo_name = row.get("geography_name")
+
+        if geo_match == "exact_match":
+            if geo_name:
+                parts.append(f"Geography exactly matches ({geo_name}).")
+            else:
+                parts.append("Geography exactly matches.")
+        elif geo_match == "parent_child_1_level":
+            parts.append(f"Geography is in a directly related parent/child region of ({geo_name}).")
+        elif geo_match == "parent_child_2_levels":
+            parts.append(f"Geography is within the same regional hierarchy, two levels away from ({geo_name}).")
+        elif geo_match == "parent_child_3_levels":
+            parts.append(f"Geography is within the same regional hierarchy, three levels away from ({geo_name}).")
+        elif geo_match == "common_ancestor":
+            parts.append(f"Geography shares a common ancestor region with ({geo_name}) in the hierarchy.")
+        elif geo_match == "distant_or_global":
+            parts.append(f"Geography is more generic or global compared to ({geo_name}).")
+
+        if not parts and geo_score and geo_score > 0.0:
+            parts.append("Geography is related to the requested region in the hierarchy.")
+
+        result[desc_id] = " ".join(parts).strip()
+
     return result
 
 
 def _fallback_explanations(topk_scored: List[tuple[float, dict, dict]]) -> Dict[str, str]:
-    """生成专业的基于规则的 LCA 解释"""
-    result = {}
+    """
+    完整基于规则的解释（语义 + unit + geography + keyword），仅在 LLM 功能不可用或失败时使用。
+    """
+    result: Dict[str, str] = {}
     for score, row, details in topk_scored:
         desc_id = str(row.get("lcia_description_id"))
         
-        parts = []
+        parts: List[str] = []
         
         sem_score = details.get("semantic", {}).get("score", 0)
         if sem_score > 4.5:
@@ -851,18 +1030,26 @@ def _fallback_explanations(topk_scored: List[tuple[float, dict, dict]]) -> Dict[
         else:
             parts.append("Moderate semantic match")
         
-        unit_match = details.get("unit", {}).get("match_type", "no_match")
+        unit = details.get("unit", {})
+        unit_match = unit.get("match_type", "no_match")
+        unit_name = row.get("unit_name")
+
         if unit_match == "exact_match":
-            parts.append("exact unit match (kWh)")
+            if unit_name:
+                parts.append(f"exact unit match ({unit_name})")
+            else:
+                parts.append("exact unit match")
         elif unit_match == "convertible":
             parts.append("convertible units (compatible measurement)")
         elif unit_match == "same_type":
-            parts.append("same unit type (energy)")
+            parts.append("same unit type")
         elif unit_match == "same_type_and_system":
-            parts.append("compatible unit system")
+            parts.append("same unit type and system")
+        elif unit_match == "same_system":
+            parts.append("same unit system")
         
-        geo_match = details.get("geography", {}).get("match_type", "not_specified")
-        geo_score = details.get("geography", {}).get("score", 0)
+        geo = details.get("geography", {})
+        geo_score = geo.get("score", 0)
         
         if geo_score >= 1.0:
             parts.append("exact geographic match")
@@ -876,7 +1063,7 @@ def _fallback_explanations(topk_scored: List[tuple[float, dict, dict]]) -> Dict[
             parts.append("common geographic region")
         
         kw_match = details.get("keyword_match", {}).get("match_type", "none")
-        if "tsvector" in kw_match:
+        if "tsvector" in kw_match or kw_match == "exact":
             parts.append("keyword alignment")
         
         if len(parts) >= 2:
@@ -1443,7 +1630,7 @@ def to_lcia_card(row: dict, explain: Optional[str] = None) -> LciaCard:
             unit_name=row.get("unit_name"),
             stage_name=row.get("stage_name"),
             process_name=row.get("process_name"),
-            explain=explain or "Based on LCIA description semantic retrieval + weighted ranking of multi-dimensional rules such as units/regions",
+            explain=explain or "Based on LCIA description semantic retrieval plus weighted ranking of unit, geography and keyword rules.",
         )
     except Exception as e:
         raise
@@ -1477,15 +1664,30 @@ async def startup_event():
 async def recommend(req: RecommendRequest):
     try:
         async with SessionLocal() as session:
+            # ① LLM 归一化意图（填补/覆盖 query_* + unit + geography + database_ids + topk）
             req = await enrich_request_with_llm_intent(session, req)
 
+            # 🔥 新增：在 LLM 解析之后，重新构建 semantic text
+            print("\n" + "="*80)
+            print("📋 AFTER LLM Intent Parsing:")
+            print("="*80)
+
+            # ② 构造 E5 向量（metadata_vec + query_vec）
             metadata_vec, query_vec, semantic_text = await build_query_embedding_v2(session, req)
             
-            print(f"\n🔍 Query Analysis:")
-            print(f"  📋 Metadata vector: {'✅ Present' if metadata_vec else '❌ None'}")
-            print(f"  💬 User query vector: {'✅ Present' if query_vec else '❌ None'}")
-            print(f"  📝 Semantic text: {semantic_text}\n")
+            print(f"  📋 Enriched Metadata Fields:")
+            print(f"     • query_lcia_name: {req.query_lcia_name or '(empty)'}")
+            print(f"     • query_upr_exchange_name: {req.query_upr_exchange_name or '(empty)'}")
+            print(f"     • query_stage_name: {req.query_stage_name or '(empty)'}")
+            print(f"     • query_process_name: {req.query_process_name or '(empty)'}")
+            print(f"     • ref_unit_id: {req.ref_unit_id or '(none)'}")
+            print(f"     • geography_id: {req.geography_id or '(none)'}")
+            print(f"     • database_ids: {req.filters.database_ids if req.filters and req.filters.database_ids else '(none)'}")
+            print(f"     • topk: {req.topk}")
+            print(f"\n  📝 Enriched Semantic Text:\n     {semantic_text}")
+            
 
+            # ③ 混合向量检索
             lcia_rows = await hybrid_search_lcia_descriptions(
                 session,
                 metadata_vec,
@@ -1496,10 +1698,12 @@ async def recommend(req: RecommendRequest):
             if not lcia_rows:
                 return RecommendResponse(items=[])
 
+            # ④ 加载 LCIA 元数据（lcia_name/upr/stage/process/unit/geo 等）
             meta_rows = await fetch_lcia_metadata_for_descriptions(session, lcia_rows)
             if not meta_rows:
                 return RecommendResponse(items=[])
 
+            # ⑤ 可选 keyword 通道
             if should_use_keyword_channel(req.query_text):
                 print("  🧩 Keyword channel enabled (tsvector).")
                 candidate_ids = [str(r["lcia_description_id"]) for r in lcia_rows]
@@ -1515,8 +1719,10 @@ async def recommend(req: RecommendRequest):
             else:
                 print("  🧩 Keyword channel skipped for this query.")
 
+            # ⑥ 批量加载 unit / geo 辅助元数据（用于打分）
             metadata = await batch_load_metadata(session, meta_rows, req)
 
+        # ⑦ 规则打分
         scored: List[tuple[float, dict, dict]] = []
         for r in meta_rows:
             result = calc_score_lcia_fast(r, req, metadata)
@@ -1533,6 +1739,7 @@ async def recommend(req: RecommendRequest):
 
         scored.sort(key=lambda x: x[0], reverse=True)
         
+        # ⑧ 过滤数据库
         filtered_scored = scored
         if req.filters and req.filters.database_ids:
             db_ids = set(req.filters.database_ids)
@@ -1540,6 +1747,14 @@ async def recommend(req: RecommendRequest):
                 (s, r, d) for s, r, d in filtered_scored
                 if r.get("lcia_database_id") and str(r["lcia_database_id"]) in db_ids
             ]
+
+            if len(filtered_scored) < req.topk:
+                print(f"\n⚠️  WARNING: Database filter reduced results from {len(scored)} to {len(filtered_scored)}")
+                print(f"   Requested top-{req.topk}, but only {len(filtered_scored)} results match the database filter.")
+                print(f"   Consider:")
+                print(f"   1. Removing the database filter")
+                print(f"   2. Adding more database IDs to the filter")
+                print(f"   3. Reducing topk to {len(filtered_scored)}")
 
         print("\n" + "🎯" * 40)
         print(f"Top-{req.topk} Results with Detailed Scoring")
@@ -1549,12 +1764,14 @@ async def recommend(req: RecommendRequest):
         for rank, (score, row, details) in enumerate(topk_results, 1):
             print_scoring_details(rank, row, score, details)
 
+        # ⑨ LLM 输出解释：语义解释 + unit/geo fallback
         explanations_map: Dict[str, str] = await llm_explain_results(req, topk_results)
 
         print(f"\n📝 Explanations map has {len(explanations_map)} entries")
         if explanations_map:
             print(f"   Sample keys: {list(explanations_map.keys())[:3]}")
 
+        # ⑩ 构造返回卡片
         cards = []
         for (score, row, details) in topk_results:
             did = str(row["lcia_description_id"])
