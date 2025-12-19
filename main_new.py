@@ -196,14 +196,21 @@ class RecommendResponse(BaseModel):
     items: List[dict]
 
 class LlmParsedMetadata(BaseModel):
+    mode: Optional[Literal["replace_all", "refine", "keep"]] = None
+
     query_lcia_name: Optional[str] = None
     query_upr_exchange_name: Optional[str] = None
     query_stage_name: Optional[str] = None
     query_process_name: Optional[str] = None
+
     geography_name: Optional[str] = None
     ref_unit_name: Optional[str] = None
+
+    # 用户明确提数据库才填，否则必须是 None
     database_names: Optional[List[str]] = None
-    topk: Optional[int] = None
+
+    # 我们强制约定为 None（用不上）
+    topk: None = None
 
     class Config:
         extra = "ignore"
@@ -470,88 +477,14 @@ async def get_geography_distance(session: AsyncSession, geo_a: str, geo_b: str) 
         return 0.0
 
 
-def should_use_keyword_channel(query: Optional[str]) -> bool:
-    """
-    Enable tsvector channel only when query contains digits/years/model numbers/uppercase abbreviations
-    to avoid affecting general natural language retrieval.
-    """
-    if not query:
-        return False
-    q = query.strip()
-    if not q:
-        return False
-
-    if any(ch.isdigit() for ch in q):
-        return True
-
-    if re.search(r"\b[A-Z]{2,}[0-9]*\b", q):
-        return True
-
-    if re.search(r"\b[A-Za-z]+-[A-Za-z0-9]+\b", q):
-        return True
-
-    return False
-
-
-async def keyword_scores_for_candidates(
-    session: AsyncSession,
-    query_text: str,
-    candidate_ids: List[str],
-) -> Dict[str, float]:
-    if not candidate_ids:
-        return {}
-
-    q = (query_text or "").strip()
-    if not q:
-        return {}
-
-    sql = text("""
-        SELECT
-            s.lcia_description_id,
-            ts_rank(
-                to_tsvector('simple', s.embedding_text),
-                plainto_tsquery('simple', :q),
-                1
-            ) * 100 AS kw_score
-        FROM lca.rag_lcia_semantic_index s
-        WHERE s.lcia_description_id = ANY(:candidate_ids)
-          AND to_tsvector('simple', s.embedding_text) @@ plainto_tsquery('simple', :q)
-    """)
-
-    res = await session.execute(sql, {
-        "q": q,
-        "candidate_ids": candidate_ids,
-    })
-    rows = res.all()
-
-    scores: Dict[str, float] = {}
-    for row in rows:
-        if row.kw_score is not None and float(row.kw_score) > 0:
-            scores[str(row.lcia_description_id)] = float(row.kw_score)
-    
-    print("🔎 keyword_scores_for_candidates -> q =", q)
-    print("   candidate_ids =", candidate_ids[:5], "...")
-    print(f"   kw rows: {len(rows)}, matched: {len(scores)}")
-    if scores:
-        print(f"   score range: {min(scores.values()):.4f} ~ {max(scores.values()):.4f}")
-    
-    return scores
-
 async def enrich_request_with_llm_intent(
     session: AsyncSession,
     req: RecommendRequest,
 ) -> RecommendRequest:
-    """
-    LLM Input：从 chat_text + 现有 query_* 字段 → 结构化 metadata（含 unit/geography/database/topk）
-
-    - 只在 chat_text 非空且 ENABLE_LLM_INTENT = True 时触发
-    - LLM 输出 JSON → LlmParsedMetadata
-    - 再从 PG 解析 unit/geography/database 的 ID，更新 RecommendRequest
-    """
     if not ENABLE_LLM_INTENT:
         print("ℹ️ LLM intent parsing is disabled")
         return req
-    
+
     chat = normalize_text_field(req.chat_text)
     if not chat:
         return req
@@ -561,35 +494,117 @@ async def enrich_request_with_llm_intent(
             system_prompt = """
 You are an assistant for a Life Cycle Assessment (LCA) EF/LCIA recommendation system.
 
-Your goal is to convert the user's request into structured search metadata that can be used
-to find suitable LCIA/EF datasets (e.g. from ecoinvent).
+Your job is to convert the user's free-text request ("chat_text") plus the current structured
+query fields into **clean, consistent search metadata** that can be used to find suitable
+LCIA/EF datasets (e.g. from ecoinvent).
 
-Interpret the request from an LCA perspective and infer, if possible:
-- The LCIA impact category or process name to search for
-- The reference product / flow name (upr_exchange_name)
-- The life cycle stage (e.g. smelting, manufacturing, use, end-of-life)
-- The specific process name (e.g. "market for electricity, high voltage, aluminium industry")
-- A reasonable unit and geography, if the user hints at them
-- Any LCIA database names and a suitable top-k value
+You MUST follow this decision tree:
 
-Return ONLY one JSON object with this exact schema:
+1) Decide the overall mode for this request:
+
+- "replace_all": the user is clearly describing a NEW scenario that does NOT match the
+  existing query_* fields (e.g. we were talking about aluminium smelting before, and now the
+  user talks about tomato cultivation).
+- "refine": the user is clearly refining the SAME scenario (e.g. adding geography, unit,
+  stage, but still talking about the same product/system).
+- "keep": the user input is too vague to safely change filters. In this case you should not
+  change any field.
+
+**Very important rules for mode:**
+- If chat_text describes a different product or system than current_query_lcia_name and
+  current_query_upr_exchange_name, you MUST set mode = "replace_all".
+- If chat_text only adds geography / unit / stage / technology details for the same product,
+  use mode = "refine".
+- If chat_text is vague like "show me more options", "next", "similar ones", use mode = "keep".
+
+2) For each metadata field, decide whether to:
+- keep the existing value from current_*  → set the field to null
+- override with a better value           → set the field to a new non-empty string
+- explicitly clear a conflicting value   → set the field to the empty string ""
+
+IMPORTANT semantics:
+- null  = "keep whatever is in current_query_*"
+- ""    = "clear the existing value (it conflicts with chat_text and you cannot give a better value)"
+
+**Very important conflict rule:**
+If chat_text clearly contradicts the existing value for a field (product, process, stage,
+geography, unit, database), you MUST NOT return null for that field.
+You must either give a new non-empty value, or set it to "".
+
+3) Field-specific rules:
+
+- query_lcia_name:
+  * Treat this as a dataset / process / market name in ecoinvent style
+    (e.g. "electricity production, natural gas, combined cycle power plant",
+     "tomato production, fresh grade, open field").
+  * DO NOT change it to generic impact categories like "climate change" or
+    "agricultural soil occupation" UNLESS the user explicitly asks for a specific
+    impact category (e.g. "climate change / GWP / land occupation").
+  * If the existing query_lcia_name clearly refers to a different product or
+    system than chat_text, either provide a new, consistent name or set it to "".
+
+- query_upr_exchange_name:
+  * This is the reference product / flow name, usually short (e.g. "electricity, high voltage",
+    "tomato, fresh grade").
+  * If chat_text specifies a different product, override it.
+
+- query_stage_name:
+  * Use this for the life cycle stage, e.g. "production", "cultivation", "import",
+    "use phase", "waste disposal".
+  * If chat_text mentions such a stage, set it accordingly. Otherwise you can keep it.
+  * If chat_text clearly indicates a different stage than the current one, override or "".
+
+- query_process_name:
+  * This should be a more specific process name, close to what appears in the database
+    (see the provided examples).
+  * If chat_text adds details (technology, size, geography), refine or adjust the
+    process name to reflect those details.
+
+- geography_name:
+  * ONLY set this when the user clearly mentions a geography (country, region, GLO, etc.).
+  * If chat_text mentions a geography that conflicts with the existing one, either provide
+    the new geography name or set it to "".
+
+- ref_unit_name (very important for functional units):
+  * ONLY change this if the user clearly refers to a unit or functional unit, e.g.:
+    "per kWh", "per kWh of electricity", "per kg of tomato",
+    "per tonne of waste", "per km", "per passenger.km", "per m2 of land", etc.
+  * Map these to simple unit names where possible:
+    - "per kg" → "kg"
+    - "per t" / "per tonne" → "t"
+    - "per kWh" → "kWh"
+    - "per km" → "km"
+    - "per passenger-km" → "passenger.km"
+    - "per m2" → "m2"
+  * If the user gives a clear unit, you SHOULD fill ref_unit_name with that unit string.
+  * If no unit is mentioned, leave ref_unit_name as null (keep existing) unless you need
+    to clear a conflicting unit.
+
+- database_names:
+  * ONLY output non-null if the user explicitly constrains the LCIA/EF database
+    (e.g. mentions "ecoinvent 3.9.1", "local Singapore EF DB", "UK Defra", etc.).
+  * If the user does not mention any database, you MUST set database_names to null.
+  * NEVER guess or invent database names, and NEVER expand to multiple databases
+    unless the user clearly requests that.
+
+- topk:
+  * ALWAYS set topk to null. Never infer a number of results.
+
+4) Output **only ONE JSON object** with the exact schema:
+
 {
-  "query_lcia_name": string or null,
-  "query_upr_exchange_name": string or null,
-  "query_stage_name": string or null,
-  "query_process_name": string or null,
-  "geography_name": string or null,
-  "ref_unit_name": string or null,
+  "mode": "replace_all | refine | keep",
+  "query_lcia_name": string or null or "",
+  "query_upr_exchange_name": string or null or "",
+  "query_stage_name": string or null or "",
+  "query_process_name": string or null or "",
+  "geography_name": string or null or "",
+  "ref_unit_name": string or null or "",
   "database_names": [string] or null,
   "topk": null
 }
 
-Rules:
-- Use short English phrases, close to ecoinvent naming style.
-- If you are not sure about a field, set it to null.
-- ALWAYS set topk to null - do not infer the number of results.
-- Do NOT invent detailed technical parameters (e.g. energy mix, exact fuel shares).
-- Do NOT output any text outside the single JSON object.
+Do NOT output any text outside this single JSON object.
 """
 
             chat_trimmed = chat[:800] if len(chat) > 800 else chat
@@ -605,7 +620,7 @@ Rules:
                 "Here is the user input and current structured query fields:\n\n"
                 f"{json.dumps(payload, ensure_ascii=False, indent=2)}\n\n"
                 "Based on this, produce ONE JSON object following the schema above.\n"
-                "If a field is not specified or cannot be inferred, set it to null.\n"
+                "Remember: null = keep existing; \"\" = clear existing.\n"
                 "JSON:"
             )
 
@@ -619,46 +634,102 @@ Rules:
             return LlmParsedMetadata.model_validate(parsed_json)
 
         parsed = await asyncio.wait_for(_parse_intent(), timeout=LLM_TIMEOUT)
-        
         if not parsed:
             print("⚠️ LLM intent parse failed, keep original request.")
             return req
 
-        # 覆盖 / 补全 query_* 四个字段
-        if parsed.query_lcia_name is not None:
-            req.query_lcia_name = parsed.query_lcia_name
+        mode = (parsed.mode or "refine").lower()
+        if mode not in {"replace_all", "refine", "keep"}:
+            mode = "refine"
 
-        if parsed.query_upr_exchange_name is not None:
-            req.query_upr_exchange_name = parsed.query_upr_exchange_name
+        if mode == "keep":
+            print("ℹ️ LLM mode=keep → do not change request.")
+            return req
 
-        if parsed.query_stage_name is not None:
-            req.query_stage_name = parsed.query_stage_name
+        def apply_field(current_value: Optional[str], new_value: Optional[str]) -> Optional[str]:
+            """
+            - new_value is None:
+                refine      → keep current
+                replace_all → clear (set None)
+            - new_value == "" (empty string from LLM):
+                → clear (set None)
+            - else:
+                → override with new_value
+            """
+            if new_value is None:
+                # 对于 replace_all，我们把所有没明确给新值的字段都清空
+                return None if mode == "replace_all" else current_value
+            if isinstance(new_value, str) and new_value.strip() == "":
+                # LLM 明确说要清空
+                return None
+            return new_value
 
-        if parsed.query_process_name is not None:
-            req.query_process_name = parsed.query_process_name
 
-        # 地理 & 单位（通过名称解析 ID）
-        if parsed.geography_name:
-            geo_id = await resolve_geography_id_by_name(session, parsed.geography_name)
-            if geo_id:
-                req.geography_id = geo_id
+        # 1) 覆盖 / 清空 query_* 四个字段
+        req.query_lcia_name = apply_field(req.query_lcia_name, parsed.query_lcia_name)
+        req.query_upr_exchange_name = apply_field(req.query_upr_exchange_name, parsed.query_upr_exchange_name)
+        req.query_stage_name = apply_field(req.query_stage_name, parsed.query_stage_name)
+        req.query_process_name = apply_field(req.query_process_name, parsed.query_process_name)
 
-        if parsed.ref_unit_name:
-            unit_id = await resolve_unit_id_by_name(session, parsed.ref_unit_name)
-            if unit_id:
-                req.ref_unit_id = unit_id
+        # 2) 地理 & 单位（通过名称解析 ID）
+        # 关键原则：只在 LLM 明确给出空字符串 "" 或成功解析出新值时才修改
+        # 否则保留原值（符合用户需求："没明确提到就保留"）
 
-        # 数据库过滤
-        db_ids: List[str] = []
-        if parsed.database_names:
-            db_ids = await resolve_lcia_database_ids_by_names(session, parsed.database_names)
+        geo_name = apply_field(None, parsed.geography_name)
+        if geo_name is not None:
+            if geo_name == "":
+                # LLM 明确说要清空
+                req.geography_id = None
+                print("   🌍 Geography cleared by LLM")
+            else:
+                # LLM 给了新值，尝试解析
+                geo_id = await resolve_geography_id_by_name(session, geo_name)
+                if geo_id:
+                    req.geography_id = geo_id
+                    print(f"   🌍 Geography updated to: {geo_name} (ID: {geo_id})")
+                else:
+                    print(f"   ⚠️ Geography '{geo_name}' not found in DB, keeping original")
+        # 否则：保留原 geography_id
 
-        if db_ids:
-            if req.filters is None:
-                req.filters = Filters()
-            req.filters.database_ids = db_ids
+        unit_name = apply_field(None, parsed.ref_unit_name)
+        if unit_name is not None:
+            if unit_name == "":
+                # LLM 明确说要清空
+                req.ref_unit_id = None
+                print("   📏 Unit cleared by LLM")
+            else:
+                # LLM 给了新值，尝试解析
+                unit_id = await resolve_unit_id_by_name(session, unit_name)
+                if unit_id:
+                    req.ref_unit_id = unit_id
+                    print(f"   📏 Unit updated to: {unit_name} (ID: {unit_id})")
+                else:
+                    print(f"   ⚠️ Unit '{unit_name}' not found in DB, keeping original")
+        # 否则：保留原 ref_unit_id
 
-        print(f"✅ LLM intent parsing applied")
+        # 3) 数据库过滤
+        # 关键原则：只在 LLM 明确给出空列表 [] 或成功解析出新值时才修改
+        # 否则保留原值（符合用户需求："没明确提到就保留"）
+
+        if parsed.database_names is not None:
+            if isinstance(parsed.database_names, list) and len(parsed.database_names) == 0:
+                # LLM 明确说要清空（空列表）
+                if req.filters is not None:
+                    req.filters.database_ids = None
+                print("   💾 Database filter cleared by LLM")
+            else:
+                # LLM 给了新值，尝试解析
+                db_ids: List[str] = await resolve_lcia_database_ids_by_names(session, parsed.database_names)
+                if db_ids:
+                    if req.filters is None:
+                        req.filters = Filters()
+                    req.filters.database_ids = db_ids
+                    print(f"   💾 Database filter updated to: {parsed.database_names} (IDs: {db_ids})")
+                else:
+                    print(f"   ⚠️ Database names {parsed.database_names} not found in DB, keeping original filter")
+        # 否则：保留原 database_ids
+
+        print(f"✅ LLM intent parsing applied (mode={mode})")
         return req
 
     except asyncio.TimeoutError:
@@ -841,7 +912,7 @@ IMPORTANT FIELD:
   - "different": clearly different product/crop (e.g. tomato vs maize, grape, chickpea, bell pepper).
   - "unknown": insufficient information.
 
-FOR EACH DATASET, write ONE independent English explanation (about 15–25 words) that:
+FOR EACH DATASET, write ONE independent English explanation in a short paragraph that:
 
 1. Focuses on how lcia_name / upr_exchange_name / stage_name / process_name relate to the user's intent.
 2. Clearly reflects product_match_label:
@@ -1014,7 +1085,7 @@ def _fallback_technical_info(topk_scored: List[tuple[float, dict, dict]]) -> Dic
 
 def _fallback_explanations(topk_scored: List[tuple[float, dict, dict]]) -> Dict[str, str]:
     """
-    完整基于规则的解释（语义 + unit + geography + keyword），仅在 LLM 功能不可用或失败时使用。
+    完整基于规则的解释（语义 + unit + geography），仅在 LLM 功能不可用或失败时使用。
     """
     result: Dict[str, str] = {}
     for score, row, details in topk_scored:
@@ -1061,10 +1132,6 @@ def _fallback_explanations(topk_scored: List[tuple[float, dict, dict]]) -> Dict[
             parts.append("broader geographic scope (3 levels)")
         elif geo_score > 0.2:
             parts.append("common geographic region")
-        
-        kw_match = details.get("keyword_match", {}).get("match_type", "none")
-        if "tsvector" in kw_match or kw_match == "exact":
-            parts.append("keyword alignment")
         
         if len(parts) >= 2:
             explanation = f"{parts[0]}. {', '.join(parts[1:])}."
@@ -1173,7 +1240,7 @@ async def hybrid_search_lcia_descriptions(
         else:
             print(f"     ⚠️  Filtered out result (query_sim={query_sim:.4f}): {desc_id}")
     
-    print(f"     • Stage 2 - After filtering: {len(filtered_results)} results")
+    print(f"     • Stage 3 - After filtering: {len(filtered_results)} results")
     
     filtered_results.sort(key=lambda x: x["combined_score"], reverse=True)
     return filtered_results[:limit]
@@ -1206,7 +1273,7 @@ async def _vector_search_within_candidates(
     return [dict(r) for r in res.mappings().all()]
 
 
-async def _vector_search(session: AsyncSession, qvec: List[float], limit: int, max_distance: float = 0.5) -> List[dict]:
+async def _vector_search(session: AsyncSession, qvec: List[float], limit: int) -> List[dict]:
     vec_literal = "[" + ",".join(str(x) for x in qvec) + "]"
     
     await session.execute(text("SET hnsw.ef_search = 400;"))
@@ -1218,7 +1285,6 @@ async def _vector_search(session: AsyncSession, qvec: List[float], limit: int, m
             s.embedding <=> CAST(:qvec AS vector) AS distance
         FROM lca.rag_lcia_semantic_index s
         WHERE s.embedding IS NOT NULL
-          AND s.embedding <=> CAST(:qvec AS vector) < :max_dist
         ORDER BY distance ASC
         LIMIT :limit;
     """)
@@ -1226,11 +1292,10 @@ async def _vector_search(session: AsyncSession, qvec: List[float], limit: int, m
     res = await session.execute(sql, {
         "qvec": vec_literal, 
         "limit": limit,
-        "max_dist": max_distance
     })
     results = [dict(r) for r in res.mappings().all()]
     
-    print(f"📊 _vector_search returned {len(results)} results (requested {limit}, max_distance={max_distance})")
+    print(f"📊 _vector_search returned {len(results)} results (requested {limit})")
     if results:
         print(f"   Distance range: {results[0]['distance']:.4f} ~ {results[-1]['distance']:.4f}")
     
@@ -1428,12 +1493,6 @@ def calc_score_lcia_fast(
                 "distance": dist,
                 "description": "Semantic similarity"
             },
-            "keyword_match": {
-                "score": 0.0,
-                "weight": 0.0,
-                "match_type": "none",
-                "description": "Keyword exact/fuzzy/tsvector matching"
-            },
             "unit": {
                 "score": 0.0,
                 "weight": 0.0,
@@ -1452,45 +1511,6 @@ def calc_score_lcia_fast(
             score_details["semantic"]["metadata_distance"] = row["metadata_distance"]
             score_details["semantic"]["query_distance"] = row["query_distance"]
             score_details["semantic"]["description"] = "Two-stage retrieval: metadata (40%) + query (60%)"
-        
-        if ui.query_text:
-            q_norm = normalize_text_field(ui.query_text)
-            if q_norm:
-                query_keywords = set(q_norm.lower().split())
-                
-                lcia_name = row.get("lcia_name", "").lower()
-                
-                exact_match_bonus = 0.0
-                fuzzy_match_penalty = 0.0
-                
-                for keyword in query_keywords:
-                    if keyword in lcia_name:
-                        exact_match_bonus += 0.3
-                        score_details["keyword_match"]["match_type"] = "exact"
-                
-                keyword_adjustment = exact_match_bonus + fuzzy_match_penalty
-                if keyword_adjustment != 0:
-                    score += keyword_adjustment
-                    score_details["keyword_match"]["score"] += keyword_adjustment
-                    score_details["keyword_match"]["weight"] += abs(keyword_adjustment)
-
-        kw_score = float(row.get("kw_score", 0.0) or 0.0)
-        if kw_score > 0.0:
-            KW_TSV_WEIGHT = 1.0
-            ts_boost = KW_TSV_WEIGHT * kw_score
-            score += ts_boost
-
-            score_details["keyword_match"]["score"] += ts_boost
-            score_details["keyword_match"]["weight"] += KW_TSV_WEIGHT
-
-            mt = score_details["keyword_match"]["match_type"]
-            if mt == "none":
-                score_details["keyword_match"]["match_type"] = "tsvector"
-            elif "tsvector" not in mt:
-                score_details["keyword_match"]["match_type"] = mt + "+tsvector"
-
-            score_details["keyword_match"]["tsvector_score"] = kw_score
-            score_details["keyword_match"]["tsvector_raw"] = kw_score / 100
 
         row_unit_id = str(row.get("unit_id")) if row.get("unit_id") else None
         ui_unit_id = str(ui.ref_unit_id) if ui.ref_unit_id else None
@@ -1594,14 +1614,6 @@ def print_scoring_details(rank: int, row: dict, score: float, details: dict):
         print(f"     • Distance: {sem.get('distance', 0.0):.4f}")
         print(f"     • Score: {sem.get('score', 0.0):.4f} (weight: {sem.get('weight', 1.0):.2f})")
     
-    keyword = details.get("keyword_match", {})
-    if keyword.get("weight", 0.0) != 0:
-        print(f"\n  🔑 Keyword Matching:")
-        print(f"     • Match Type: {keyword.get('match_type', 'none')}")
-        print(f"     • Score: {keyword.get('score', 0.0):.4f} (weight: {keyword.get('weight', 0.0):.2f})")
-        if "tsvector_score" in keyword:
-            print(f"     • tsvector raw score: {keyword.get('tsvector_score', 0.0):.4f}")
-    
     unit = details.get("unit", {})
     print(f"\n  📏 Unit Matching:")
     print(f"     • Match Type: {unit.get('match_type', 'no_match')}")
@@ -1630,7 +1642,7 @@ def to_lcia_card(row: dict, explain: Optional[str] = None) -> LciaCard:
             unit_name=row.get("unit_name"),
             stage_name=row.get("stage_name"),
             process_name=row.get("process_name"),
-            explain=explain or "Based on LCIA description semantic retrieval plus weighted ranking of unit, geography and keyword rules.",
+            explain=explain or "Based on LCIA description semantic retrieval plus weighted ranking of unit and geography.",
         )
     except Exception as e:
         raise
@@ -1702,22 +1714,6 @@ async def recommend(req: RecommendRequest):
             meta_rows = await fetch_lcia_metadata_for_descriptions(session, lcia_rows)
             if not meta_rows:
                 return RecommendResponse(items=[])
-
-            # ⑤ 可选 keyword 通道
-            if should_use_keyword_channel(req.query_text):
-                print("  🧩 Keyword channel enabled (tsvector).")
-                candidate_ids = [str(r["lcia_description_id"]) for r in lcia_rows]
-                kw_scores = await keyword_scores_for_candidates(
-                    session,
-                    req.query_text or "",
-                    candidate_ids,
-                )
-                for r in meta_rows:
-                    did = str(r["lcia_description_id"])
-                    if did in kw_scores:
-                        r["kw_score"] = kw_scores[did]
-            else:
-                print("  🧩 Keyword channel skipped for this query.")
 
             # ⑥ 批量加载 unit / geo 辅助元数据（用于打分）
             metadata = await batch_load_metadata(session, meta_rows, req)
