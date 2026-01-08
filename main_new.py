@@ -16,19 +16,25 @@ from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, Asyn
 from sqlalchemy import text
 
 from sentence_transformers import SentenceTransformer
+
+# 🔥 Groq API
 from groq import Groq
 
 EMBED_DIM = 384
 _EMBED_MODEL: Optional[SentenceTransformer] = None
+
+# LLM Configuration
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 ENABLE_LLM_INTENT = True
 ENABLE_LLM_EXPLANATION = True
 LLM_TIMEOUT = 30.0
 
+# Groq 客户端
 _GROQ_CLIENT = None
 
 def get_groq_client():
+    """获取 Groq 客户端"""
     global _GROQ_CLIENT
     if _GROQ_CLIENT is None and GROQ_API_KEY:
         _GROQ_CLIENT = Groq(api_key=GROQ_API_KEY)
@@ -45,6 +51,12 @@ def get_embed_model() -> SentenceTransformer:
 
 
 def llm_generate(prompt: str, max_new_tokens: int = 256) -> str:
+    """
+    LLM 调用接口 - 使用 Groq API
+    当前约定：
+    - system message 固定为 “You are a helpful assistant that outputs only JSON.”
+    - user message 放完整 prompt（包含 schema、说明等）
+    """
     try:
         client = get_groq_client()
         
@@ -77,6 +89,9 @@ def llm_generate(prompt: str, max_new_tokens: int = 256) -> str:
 
 
 def extract_json_block(text: str) -> Optional[dict]:
+    """
+    从 LLM 回复里提取第一个 JSON 对象并解析
+    """
     if not text:
         return None
     start = text.find("{")
@@ -90,6 +105,13 @@ def extract_json_block(text: str) -> Optional[dict]:
         return None
 
 def clean_llm_explanation(value: Any) -> Optional[str]:
+    """
+    从 LLM 返回值中提取纯文本解释
+    处理三种情况:
+    1. 直接字符串
+    2. 包含 reason_for_relevance 的字典
+    3. 其他结构化格式
+    """
     if isinstance(value, str):
         return value.strip()
     
@@ -183,7 +205,11 @@ class LlmParsedMetadata(BaseModel):
 
     geography_name: Optional[str] = None
     ref_unit_name: Optional[str] = None
+
+    # 用户明确提数据库才填，否则必须是 None
     database_names: Optional[List[str]] = None
+
+    # 我们强制约定为 None（用不上）
     topk: None = None
 
     class Config:
@@ -631,46 +657,68 @@ Do NOT output any text outside this single JSON object.
                 → override with new_value
             """
             if new_value is None:
+                # 对于 replace_all，我们把所有没明确给新值的字段都清空
                 return None if mode == "replace_all" else current_value
             if isinstance(new_value, str) and new_value.strip() == "":
+                # LLM 明确说要清空
                 return None
             return new_value
 
+
+        # 1) 覆盖 / 清空 query_* 四个字段
         req.query_lcia_name = apply_field(req.query_lcia_name, parsed.query_lcia_name)
         req.query_upr_exchange_name = apply_field(req.query_upr_exchange_name, parsed.query_upr_exchange_name)
         req.query_stage_name = apply_field(req.query_stage_name, parsed.query_stage_name)
         req.query_process_name = apply_field(req.query_process_name, parsed.query_process_name)
+
+        # 2) 地理 & 单位（通过名称解析 ID）
+        # 关键原则：只在 LLM 明确给出空字符串 "" 或成功解析出新值时才修改
+        # 否则保留原值（符合用户需求："没明确提到就保留"）
+
         geo_name = apply_field(None, parsed.geography_name)
         if geo_name is not None:
             if geo_name == "":
+                # LLM 明确说要清空
                 req.geography_id = None
                 print("   🌍 Geography cleared by LLM")
             else:
+                # LLM 给了新值，尝试解析
                 geo_id = await resolve_geography_id_by_name(session, geo_name)
                 if geo_id:
                     req.geography_id = geo_id
                     print(f"   🌍 Geography updated to: {geo_name} (ID: {geo_id})")
                 else:
                     print(f"   ⚠️ Geography '{geo_name}' not found in DB, keeping original")
+        # 否则：保留原 geography_id
+
         unit_name = apply_field(None, parsed.ref_unit_name)
         if unit_name is not None:
             if unit_name == "":
+                # LLM 明确说要清空
                 req.ref_unit_id = None
                 print("   📏 Unit cleared by LLM")
             else:
+                # LLM 给了新值，尝试解析
                 unit_id = await resolve_unit_id_by_name(session, unit_name)
                 if unit_id:
                     req.ref_unit_id = unit_id
                     print(f"   📏 Unit updated to: {unit_name} (ID: {unit_id})")
                 else:
                     print(f"   ⚠️ Unit '{unit_name}' not found in DB, keeping original")
+        # 否则：保留原 ref_unit_id
+
+        # 3) 数据库过滤
+        # 关键原则：只在 LLM 明确给出空列表 [] 或成功解析出新值时才修改
+        # 否则保留原值（符合用户需求："没明确提到就保留"）
 
         if parsed.database_names is not None:
             if isinstance(parsed.database_names, list) and len(parsed.database_names) == 0:
+                # LLM 明确说要清空（空列表）
                 if req.filters is not None:
                     req.filters.database_ids = None
                 print("   💾 Database filter cleared by LLM")
             else:
+                # LLM 给了新值，尝试解析
                 db_ids: List[str] = await resolve_lcia_database_ids_by_names(session, parsed.database_names)
                 if db_ids:
                     if req.filters is None:
@@ -679,6 +727,7 @@ Do NOT output any text outside this single JSON object.
                     print(f"   💾 Database filter updated to: {parsed.database_names} (IDs: {db_ids})")
                 else:
                     print(f"   ⚠️ Database names {parsed.database_names} not found in DB, keeping original filter")
+        # 否则：保留原 database_ids
 
         print(f"✅ LLM intent parsing applied (mode={mode})")
         return req
@@ -696,6 +745,10 @@ def _build_lcia_context_sentence(
     stage_name: Optional[str],
     process_name: Optional[str],
 ) -> str:
+    """
+    把 lcia_name / upr_exchange_name / stage_name / process_name 组合成一条简洁的 LCA 语境句，
+    方便 LLM 快速理解整体含义，但不替代结构化字段。
+    """
     parts = []
 
     lcia = (lcia_name or "").strip()
@@ -722,15 +775,29 @@ def _build_lcia_context_sentence(
 
 
 def _normalize_product_name(name: Optional[str]) -> str:
+    """
+    取产品名的“主干”：小写 + 去掉逗号后面部分 + 去掉非字母数字。
+    例如：
+      "Tomato, fresh grade" -> "tomato"
+      "electricity, high voltage, aluminium industry" -> "electricity high voltage aluminium industry"
+    """
     if not name:
         return ""
     s = str(name).lower()
+    # 只取第一个逗号前面的主产品部分（作物场景很有用）
     s = s.split(",")[0]
     s = re.sub(r"[^a-z0-9]+", " ", s)
     return s.strip()
 
 
 def _product_match_label(query_product: Optional[str], candidate_product: Optional[str]) -> str:
+    """
+    粗略判定产品匹配程度：
+      - exact: 主名几乎一样（相等或一个包含另一个）
+      - overlap: 有词交集（例如 "tomato fresh" vs "tomato canned"）
+      - different: 完全不同（番茄 vs 玉米、葡萄等）
+      - unknown: 缺字段
+    """
     q = _normalize_product_name(query_product)
     c = _normalize_product_name(candidate_product)
 
@@ -751,16 +818,31 @@ async def llm_explain_results(
     req: RecommendRequest,
     topk_scored: List[tuple[float, dict, dict]],
 ) -> Dict[str, str]:
+    """
+    LLM Output：解释为什么匹配（专注 LCA 语义）
+
+    新逻辑：
+    1. 在 Python 里先计算 product_match_label（exact / overlap / different / unknown）；
+    2. LLM 只做“语义解释”，但必须根据 product_match_label 说明：
+       - exact: 主匹配，直接对应用户要的产品/过程；
+       - overlap: 近似产品，说明相关性；
+       - different: 不同作物/产品，只能作为 proxy / 参考；
+    3. unit / geography 的解释仍由 _fallback_technical_info 基于规则拼接；
+    4. 如果 LLM 失败或覆盖率太低，则纯规则 fallback。
+    """
     if not ENABLE_LLM_EXPLANATION:
         print("ℹ️ LLM explanation is disabled, using fallback")
         return _fallback_explanations(topk_scored)
     
     if not topk_scored:
         return {}
+
+    # 规则侧 unit/geo 解释
     fallback_technical = _fallback_technical_info(topk_scored)
     
     try:
         async def _generate_semantic_explanations():
+            # 构造用户意图的结构化 + 组合句
             query_context = {
                 "lcia_name": req.query_lcia_name or "",
                 "upr_exchange_name": req.query_upr_exchange_name or "",
@@ -798,6 +880,7 @@ async def llm_explain_results(
                     "stage_name": stage_name,
                     "process_name": process_name,
                     "product_match_label": product_match,
+                    # 👇 新增：组合句，辅助 LLM 理解整体语境
                     "combined_text": _build_lcia_context_sentence(
                         lcia_name,
                         upr_name,
@@ -883,6 +966,7 @@ JSON:
             print(f"🤖 LLM output: {len(raw_output)} chars")
             print(f"   Preview: {raw_output[:300]}...")
 
+            # 清理可能的 ```json 包裹
             raw_output_clean = raw_output.replace("```json", "").replace("```", "").strip()
             parsed = extract_json_block(raw_output_clean)
 
@@ -890,12 +974,14 @@ JSON:
                 print("❌ Failed to parse JSON from LLM output")
                 return None
             
+            # 清洗解释文本
             cleaned_parsed: Dict[str, str] = {}
             for desc_id, value in parsed.items():
                 text = clean_llm_explanation(value)
                 if text:
                     cleaned_parsed[desc_id] = text
 
+            # 匹配率检查：至少一半候选有解释才算 OK
             matched = sum(1 for did in expected_ids if did in cleaned_parsed)
             total = len(expected_ids)
             print(f"   Matched explanations: {matched}/{total}")
@@ -940,11 +1026,18 @@ JSON:
 
 
 def _fallback_technical_info(topk_scored: List[tuple[float, dict, dict]]) -> Dict[str, str]:
+    """
+    仅基于 unit / geography 打分细节生成技术说明片段，拼接在 LLM 语义解释后面。
+    不涉及语义匹配，只解释：
+    - 单位是否精确匹配 / 可转换 / 同类型；
+    - 地理是否精确 / 上下游层级 / 共同祖先 / 更广区域。
+    """
     result: Dict[str, str] = {}
     for _, row, details in topk_scored:
         desc_id = str(row.get("lcia_description_id"))
         parts: List[str] = []
 
+        # 单位解释
         unit_info = details.get("unit", {})
         unit_match = unit_info.get("match_type", "no_match")
         unit_name = row.get("unit_name")
@@ -960,6 +1053,7 @@ def _fallback_technical_info(topk_scored: List[tuple[float, dict, dict]]) -> Dic
             parts.append("Unit measures the same physical quantity and is convertible.")
         elif unit_match == "same_system":
             parts.append("Unit is in the same unit system and convertible.")
+        # 地理解释
         geo_info = details.get("geography", {})
         geo_match = geo_info.get("match_type")
         geo_score = geo_info.get("score", 0.0)
@@ -990,7 +1084,9 @@ def _fallback_technical_info(topk_scored: List[tuple[float, dict, dict]]) -> Dic
 
 
 def _fallback_explanations(topk_scored: List[tuple[float, dict, dict]]) -> Dict[str, str]:
-
+    """
+    完整基于规则的解释（语义 + unit + geography），仅在 LLM 功能不可用或失败时使用。
+    """
     result: Dict[str, str] = {}
     for score, row, details in topk_scored:
         desc_id = str(row.get("lcia_description_id"))
@@ -1557,17 +1653,20 @@ app = FastAPI(title="LEAF RAG LCIA Recommendations", version="1.0.0-groq-only")
 
 @app.on_event("startup")
 async def startup_event():
+    """应用启动时预加载模型"""
     print("🚀 Initializing LCIA Recommendation API...")
     print(f"   • LLM Intent: {'✅ Enabled' if ENABLE_LLM_INTENT else '❌ Disabled'}")
     print(f"   • LLM Explanation: {'✅ Enabled' if ENABLE_LLM_EXPLANATION else '❌ Disabled'}")
     print(f"   • LLM Timeout: {LLM_TIMEOUT}s")
     print(f"   • LLM Provider: 🌐 Groq API (llama-3.3-70b-versatile)")
     
+    # 初始化 Groq 客户端
     if not GROQ_API_KEY:
         print("   ⚠️  WARNING: GROQ_API_KEY not set - LLM features will fail")
     else:
         get_groq_client()
     
+    # 预加载 embedding 模型
     await asyncio.to_thread(get_embed_model)
     
     print("✅ API ready")
@@ -1577,12 +1676,15 @@ async def startup_event():
 async def recommend(req: RecommendRequest):
     try:
         async with SessionLocal() as session:
+            # ① LLM 归一化意图（填补/覆盖 query_* + unit + geography + database_ids + topk）
             req = await enrich_request_with_llm_intent(session, req)
 
+            # 🔥 新增：在 LLM 解析之后，重新构建 semantic text
             print("\n" + "="*80)
             print("📋 AFTER LLM Intent Parsing:")
             print("="*80)
 
+            # ② 构造 E5 向量（metadata_vec + query_vec）
             metadata_vec, query_vec, semantic_text = await build_query_embedding_v2(session, req)
             
             print(f"  📋 Enriched Metadata Fields:")
@@ -1597,6 +1699,7 @@ async def recommend(req: RecommendRequest):
             print(f"\n  📝 Enriched Semantic Text:\n     {semantic_text}")
             
 
+            # ③ 混合向量检索
             lcia_rows = await hybrid_search_lcia_descriptions(
                 session,
                 metadata_vec,
@@ -1607,12 +1710,15 @@ async def recommend(req: RecommendRequest):
             if not lcia_rows:
                 return RecommendResponse(items=[])
 
+            # ④ 加载 LCIA 元数据（lcia_name/upr/stage/process/unit/geo 等）
             meta_rows = await fetch_lcia_metadata_for_descriptions(session, lcia_rows)
             if not meta_rows:
                 return RecommendResponse(items=[])
 
+            # ⑥ 批量加载 unit / geo 辅助元数据（用于打分）
             metadata = await batch_load_metadata(session, meta_rows, req)
 
+        # ⑦ 规则打分
         scored: List[tuple[float, dict, dict]] = []
         for r in meta_rows:
             result = calc_score_lcia_fast(r, req, metadata)
@@ -1629,6 +1735,7 @@ async def recommend(req: RecommendRequest):
 
         scored.sort(key=lambda x: x[0], reverse=True)
         
+        # ⑧ 过滤数据库
         filtered_scored = scored
         if req.filters and req.filters.database_ids:
             db_ids = set(req.filters.database_ids)
@@ -1653,12 +1760,14 @@ async def recommend(req: RecommendRequest):
         for rank, (score, row, details) in enumerate(topk_results, 1):
             print_scoring_details(rank, row, score, details)
 
+        # ⑨ LLM 输出解释：语义解释 + unit/geo fallback
         explanations_map: Dict[str, str] = await llm_explain_results(req, topk_results)
 
         print(f"\n📝 Explanations map has {len(explanations_map)} entries")
         if explanations_map:
             print(f"   Sample keys: {list(explanations_map.keys())[:3]}")
 
+        # ⑩ 构造返回卡片
         cards = []
         for (score, row, details) in topk_results:
             did = str(row["lcia_description_id"])
