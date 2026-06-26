@@ -1,12 +1,16 @@
 import os
+from pathlib import Path
 import torch
 import numpy as np
 from tqdm import tqdm
+from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy import text
 import asyncio
 import urllib.parse
+
+load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
 
 DB_USER = os.getenv("DB_USER")
 DB_PWD = os.getenv("DB_PWD")
@@ -81,6 +85,49 @@ def build_embedding_text(row) -> str:
     return f"passage: {core_text.strip()}"
 
 
+def build_name_text(row) -> str:
+    """PRIMARY group embedding text: product identity (lcia_name + upr_exchange_name + cpc)."""
+    lcia_name = normalize_meta_field(row.get("lcia_name"))
+    upr_name = normalize_meta_field(row.get("upr_exchange_name"))
+    cpc_name = normalize_meta_field(row.get("cpc_name"))
+
+    parts = []
+    if lcia_name:
+        parts.append(f"LCIA name: {lcia_name}")
+    if upr_name:
+        parts.append(f"Reference product: {upr_name}")
+    if cpc_name:
+        parts.append(f"CPC name: {cpc_name}")
+    if not parts:
+        parts.append("LCIA product: (no name)")
+
+    return f"passage: {' | '.join(parts).strip()}"
+
+
+def build_context_text(row) -> str:
+    """SECONDARY group embedding text: process context (stage + process + comment)."""
+    stage_names = [s for s in (row.get("stage_names") or []) if normalize_meta_field(s)]
+    process_names = [s for s in (row.get("process_names") or []) if normalize_meta_field(s)]
+    general_comment = normalize_meta_field(row.get("general_comment"))
+
+    parts = []
+    if stage_names:
+        parts.append(f"Stage: {safe_join(stage_names)}")
+    if process_names:
+        parts.append(f"Process: {safe_join(process_names)}")
+    if general_comment:
+        parts.append(f"General comment: {general_comment}")
+    if not parts:
+        parts.append("LCIA context: (no stage/process)")
+
+    return f"passage: {' | '.join(parts).strip()}"
+
+
+def vec_str(emb) -> str:
+    """Format a numpy embedding row as a pgvector literal."""
+    return "[" + ",".join(f"{x:.6f}" for x in emb.tolist()) + "]"
+
+
 def embed_texts(texts):
     embeddings = model.encode(
         texts,
@@ -146,39 +193,50 @@ async def build_lcia_semantic_index(fetch_size: int = 5000, batch_size: int = 50
             if not rows:
                 break
 
-            texts_to_embed = []
+            texts_combined = []
+            texts_name = []
+            texts_context = []
             rows_data = []
 
             for r in rows:
                 row_dict = dict(r)
-                embedding_text = build_embedding_text(row_dict)
-                texts_to_embed.append(embedding_text)
+                combined_text = build_embedding_text(row_dict)
+                texts_combined.append(combined_text)
+                texts_name.append(build_name_text(row_dict))
+                texts_context.append(build_context_text(row_dict))
                 rows_data.append({
                     "lcia_description_id": str(row_dict["lcia_description_id"]),
-                    "embedding_text": embedding_text,
+                    "embedding_text": combined_text,
                 })
 
-            embeddings = embed_texts(texts_to_embed)
+            emb_combined = embed_texts(texts_combined)
+            emb_name = embed_texts(texts_name)
+            emb_context = embed_texts(texts_context)
 
             insert_sql = text("""
                 INSERT INTO lca.rag_lcia_semantic_index
-                    (lcia_description_id, embedding_text, embedding)
-                VALUES (:lcia_description_id, :embedding_text, :embedding)
+                    (lcia_description_id, embedding_text, embedding, name_embedding, context_embedding)
+                VALUES (:lcia_description_id, :embedding_text, :embedding, :name_embedding, :context_embedding)
                 ON CONFLICT (lcia_description_id)
                 DO UPDATE SET
-                    embedding_text = EXCLUDED.embedding_text,
-                    embedding      = EXCLUDED.embedding
+                    embedding_text    = EXCLUDED.embedding_text,
+                    embedding         = EXCLUDED.embedding,
+                    name_embedding    = EXCLUDED.name_embedding,
+                    context_embedding = EXCLUDED.context_embedding
             """)
 
             for i in range(0, len(rows_data), batch_size):
                 batch_rows = rows_data[i:i + batch_size]
-                emb_slice = embeddings[i:i + batch_size]
+                comb_slice = emb_combined[i:i + batch_size]
+                name_slice = emb_name[i:i + batch_size]
+                ctx_slice = emb_context[i:i + batch_size]
 
-                for data, emb in zip(batch_rows, emb_slice):
-                    vec_str = "[" + ",".join(f"{x:.6f}" for x in emb.tolist()) + "]"
+                for data, ce, ne, xe in zip(batch_rows, comb_slice, name_slice, ctx_slice):
                     data_with_emb = {
                         **data,
-                        "embedding": vec_str,
+                        "embedding": vec_str(ce),
+                        "name_embedding": vec_str(ne),
+                        "context_embedding": vec_str(xe),
                     }
                     await session.execute(insert_sql, data_with_emb)
 
@@ -190,6 +248,43 @@ async def build_lcia_semantic_index(fetch_size: int = 5000, batch_size: int = 50
 
         pbar.close()
         print(f"✅ Completed: {processed} LCIA descriptions processed.")
+
+        await refresh_activity_index(session)
+
+
+async def refresh_activity_index(session):
+    """
+    Rebuild the deduplicated activity-level index (one row per distinct lcia_name)
+    from the per-description embeddings just written. This is what the recommend
+    recall searches: one row per activity removes the vector duplication that
+    otherwise collapses results to a single card. Derived from existing
+    embeddings — no extra encoding.
+    """
+    print("🔄 Refreshing lca.rag_lcia_activity_index (dedup by lcia_name) ...")
+    await session.execute(text("""
+        CREATE TABLE IF NOT EXISTS lca.rag_lcia_activity_index (
+            lcia_name         text PRIMARY KEY,
+            name_embedding    vector(384) NOT NULL,
+            context_embedding vector(384) NOT NULL
+        )
+    """))
+    await session.execute(text("TRUNCATE lca.rag_lcia_activity_index"))
+    await session.execute(text("""
+        INSERT INTO lca.rag_lcia_activity_index (lcia_name, name_embedding, context_embedding)
+        SELECT DISTINCT ON (ln.name)
+               ln.name, r.name_embedding, r.context_embedding
+        FROM lca.rag_lcia_semantic_index r
+        JOIN lca.lcia_description ld ON ld.id = r.lcia_description_id
+        JOIN lca.lcia l             ON l.id = ld.lcia_id
+        JOIN lca.lcia_name ln       ON ln.id = l.lcia_name_id
+        WHERE r.name_embedding IS NOT NULL
+          AND r.context_embedding IS NOT NULL
+          AND ln.name IS NOT NULL
+        ORDER BY ln.name, r.lcia_description_id
+    """))
+    await session.commit()
+    count = (await session.execute(text("SELECT COUNT(*) FROM lca.rag_lcia_activity_index"))).scalar()
+    print(f"✅ Activity index refreshed: {count} distinct activities")
 
 
 async def main():
